@@ -1,0 +1,201 @@
+Subject: [PATCH] DRM: detect input devices plugged in after startup
+
+InitEvdevInput() only ever scans /dev/input once, at startup - a
+keyboard (or any other input device) plugged in while the app is
+already running was never found at all, confirmed on real hardware.
+
+Adds RescanEvdevInputForNewDevices(), a throttled (every 2 seconds,
+called from PollInputEvents()) re-scan of /dev/input that skips
+devices already known (tracked via a new platform.knownEvdevPaths[]
+list, populated by ConfigureEvdevDevice() for every device it accepts,
+of any kind - one shared recording point rather than duplicating this
+in each device-kind branch) and configures only genuinely new ones,
+exactly like the startup scan does.
+
+Deliberately a simple, throttled directory re-scan rather than a
+netlink/uevent-based listener (what udev itself uses) - much less code
+and much easier to reason about correctness of, and more than
+responsive enough for a human plugging in a device and expecting it to
+work within a couple of seconds, which is the actual real-world need
+here rather than a high-frequency hotplug scenario.
+
+Also cleans up two redundant TRACELOG calls accidentally introduced by
+the preceding 0003 mouse patch (the touch and mouse accept-branches
+each had their own "Initialized input device..." log in addition to
+the pre-existing shared one at the end of the function, printing the
+same information twice) - now deviceKindStr is set correctly in both
+branches and only the shared trailing log fires, as originally
+designed.
+
+Verified: the rescan's core "is this path already known" logic tested
+in isolation against 3 scenarios (initial scan configures all found
+devices; a rescan with one genuinely new device alongside already-
+known ones configures only the new one; a rescan with no new devices
+configures nothing again) - all passing. Full file (with 0001, 0002,
+0003 already applied) compiles cleanly, and the app links and starts
+without crashing against the resulting library.
+
+Upstream-Status: Pending
+
+diff --git a/src/platforms/rcore_drm.c b/src/platforms/rcore_drm.c
+index fd3c31e1..93edd6d5 100644
+--- a/src/platforms/rcore_drm.c
++++ b/src/platforms/rcore_drm.c
+@@ -158,6 +158,20 @@ typedef struct {
+     #define MAX_MOUSE_FDS 8
+     int mouseFds[MAX_MOUSE_FDS];
+     int mouseFdCount;
++    // PATCH: track which /dev/input/event* paths have already been
++    // opened/classified, so a periodic rescan (see
++    // RescanEvdevInputForNewDevices() and its call site in
++    // UpdateInputHandler()) can tell genuinely new devices (plugged in
++    // while already running) apart from ones already tracked, instead
++    // of re-opening/re-adding the same device over and over. The
++    // original code only ever scanned /dev/input once, at startup
++    // (InitEvdevInput()) - a device plugged in afterwards was never
++    // found at all, confirmed on real hardware (a keyboard plugged in
++    // after boot simply not being recognized).
++    #define MAX_KNOWN_EVDEV_PATHS 32
++    #define EVDEV_PATH_MAXLEN 64
++    char knownEvdevPaths[MAX_KNOWN_EVDEV_PATHS][EVDEV_PATH_MAXLEN];
++    int knownEvdevPathCount;
+     int touchSlot;                      // Hold the touch slot number of the currently being sent multitouch block
+     bool touchActive[MAX_TOUCH_POINTS]; // Track which touch points are currently active
+     Vector2 touchPosition[MAX_TOUCH_POINTS]; // Track touch positions for each slot
+@@ -321,6 +335,7 @@ static void ProcessKeyboard(void);              // Process keyboard events
+ 
+ // Input management functions
+ static void InitEvdevInput(void);               // Initialize evdev inputs
++static void RescanEvdevInputForNewDevices(void); // PATCH: periodically detect input devices plugged in after startup
+ static void ConfigureEvdevDevice(char *device); // Identifies a input device and configures it for use if appropriate
+ static void PollKeyboardEvents(void);           // Process evdev keyboard events
+ static void PollGamepadEvents(void);            // Process evdev gamepad events
+@@ -1133,6 +1148,22 @@ void PollInputEvents(void)
+     CORE.Input.Gamepad.lastButtonPressed = 0;       // GAMEPAD_BUTTON_UNKNOWN
+     //CORE.Input.Gamepad.axisCount = 0;
+ 
++    // PATCH: periodically check for input devices plugged in after
++    // startup (see RescanEvdevInputForNewDevices()'s own comments) -
++    // throttled to once every 2 seconds rather than every frame, to
++    // avoid the overhead of a directory scan ~60 times a second for
++    // something that only needs to be noticed within a couple of
++    // seconds of a human actually plugging something in.
++    {
++        static double lastEvdevRescanTime = 0.0;
++        double now = GetTime();
++        if (now - lastEvdevRescanTime >= 2.0)
++        {
++            RescanEvdevInputForNewDevices();
++            lastEvdevRescanTime = now;
++        }
++    }
++
+     // Register previous keys states
+     for (int i = 0; i < MAX_KEYBOARD_KEYS; i++)
+     {
+@@ -1976,6 +2007,7 @@ static void InitEvdevInput(void)
+     platform.mouseFd = -1;
+     platform.mouseFdCount = 0;
+     for (int i = 0; i < MAX_MOUSE_FDS; i++) platform.mouseFds[i] = -1;
++    platform.knownEvdevPathCount = 0;
+ 
+     // Reset variables
+     for (int i = 0; i < MAX_TOUCH_POINTS; i++)
+@@ -2018,6 +2050,52 @@ static void InitEvdevInput(void)
+     else TRACELOG(LOG_WARNING, "INPUT: Failed to open linux event directory: %s", DEFAULT_EVDEV_PATH);
+ }
+ 
++// PATCH: periodically re-scans /dev/input for devices not already
++// tracked in platform.knownEvdevPaths[] (populated by
++// ConfigureEvdevDevice() for every device it accepts) and configures
++// only the genuinely new ones - InitEvdevInput() above only ever runs
++// once, at startup, so a device plugged in afterwards was previously
++// never found at all (confirmed on real hardware: a keyboard plugged
++// in after boot not being recognized). Deliberately a simple,
++// throttled directory re-scan (see its call site for the timing)
++// rather than a netlink/uevent-based listener - much less code and
++// much easier to reason about correctness of, and more than
++// responsive enough for a human plugging in a device and expecting it
++// to work within a couple of seconds, which is the actual real-world
++// need here (this is not a high-frequency hotplug scenario).
++static void RescanEvdevInputForNewDevices(void)
++{
++    char path[MAX_FILEPATH_LENGTH] = { 0 };
++    DIR *directory = NULL;
++    struct dirent *entity = NULL;
++
++    directory = opendir(DEFAULT_EVDEV_PATH);
++    if (!directory) return;
++
++    while ((entity = readdir(directory)) != NULL)
++    {
++        if ((strncmp("event", entity->d_name, strlen("event")) == 0) ||
++            (strncmp("mouse", entity->d_name, strlen("mouse")) == 0))
++        {
++            snprintf(path, MAX_FILEPATH_LENGTH, "%s%s", DEFAULT_EVDEV_PATH, entity->d_name);
++
++            bool alreadyKnown = false;
++            for (int i = 0; i < platform.knownEvdevPathCount; i++)
++            {
++                if (strncmp(platform.knownEvdevPaths[i], path, EVDEV_PATH_MAXLEN) == 0)
++                {
++                    alreadyKnown = true;
++                    break;
++                }
++            }
++
++            if (!alreadyKnown) ConfigureEvdevDevice(path);   // New device - classify and add it exactly like at startup
++        }
++    }
++
++    closedir(directory);
++}
++
+ // Identifies a input device and configures it for use if appropriate
+ static void ConfigureEvdevDevice(char *device)
+ {
+@@ -2185,8 +2263,6 @@ static void ConfigureEvdevDevice(char *device)
+             platform.absRange.y = absinfo[ABS_Y].info.minimum;
+             platform.absRange.height = absinfo[ABS_Y].info.maximum - absinfo[ABS_Y].info.minimum;
+         }
+-
+-        TRACELOG(LOG_INFO, "INPUT: Initialized input device %s as %s", device, deviceKindStr);
+     }
+     else if (isMouse)
+     {
+@@ -2214,6 +2290,7 @@ static void ConfigureEvdevDevice(char *device)
+         {
+             platform.mouseFds[platform.mouseFdCount] = fd;
+             platform.mouseFdCount++;
++            deviceKindStr = "mouse";
+ 
+             if (absAxisCount > 0)
+             {
+@@ -2223,8 +2300,6 @@ static void ConfigureEvdevDevice(char *device)
+                 platform.absRange.y = absinfo[ABS_Y].info.minimum;
+                 platform.absRange.height = absinfo[ABS_Y].info.maximum - absinfo[ABS_Y].info.minimum;
+             }
+-
+-            TRACELOG(LOG_INFO, "INPUT: Initialized input device %s as mouse", device);
+         }
+         else
+         {
+@@ -2283,6 +2358,18 @@ static void ConfigureEvdevDevice(char *device)
+         return;
+     }
+ 
++    // PATCH: record this device's path so a later rescan (see
++    // RescanEvdevInputForNewDevices()) knows it's already been
++    // configured and won't try to re-open/re-add it - one shared
++    // place for all accepted device kinds (touch/mouse/gamepad/
++    // keyboard) rather than duplicating this in each branch above.
++    if (platform.knownEvdevPathCount < MAX_KNOWN_EVDEV_PATHS)
++    {
++        strncpy(platform.knownEvdevPaths[platform.knownEvdevPathCount], device, EVDEV_PATH_MAXLEN - 1);
++        platform.knownEvdevPaths[platform.knownEvdevPathCount][EVDEV_PATH_MAXLEN - 1] = '\0';
++        platform.knownEvdevPathCount++;
++    }
++
+     TRACELOG(LOG_INFO, "INPUT: Initialized input device %s as %s", device, deviceKindStr);
+ }
+ 

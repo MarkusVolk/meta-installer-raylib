@@ -1,0 +1,14 @@
+[Unit]
+Description=Auto-mount USB device %i
+# Ties this service's own lifecycle directly to the underlying device
+# unit existing - when the device disappears (physical removal),
+# systemd stops this service automatically, running ExecStop (the
+# unmount) without anything else needing to notice/trigger it.
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/usb-automount-helper.sh mount %i
+ExecStop=/usr/bin/usb-automount-helper.sh umount %i

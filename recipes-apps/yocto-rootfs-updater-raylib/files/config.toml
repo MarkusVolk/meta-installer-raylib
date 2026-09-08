@@ -1,0 +1,47 @@
+# Yocto RootFS Updater - default directories.
+# Optional: if this file is missing or a key isn't set, the built-in
+# fallbacks below are used. Edit and re-flash, or overlay onto a
+# running system at this same path (no rebuild needed).
+
+rootfs_mountpoint = "/mnt/target"
+boot_mountpoint = "/mnt/boot"
+
+# Pre-fills the "Excludes" field (comma-separated paths kept instead
+# of overwritten during a rootfs update). Still fully editable per run.
+#excludes_default = "home,etc/hostname,etc/machine-id"
+
+# Pre-fills the SHA256 field for the given source. Applies regardless
+# of local/HTTP/HTTPS. Best for a stable "golden image" that rarely
+# changes.
+#rootfs_sha256_default = ""
+#wic_sha256_default = ""
+#kernel_sha256_default = ""
+
+# If storage-partition-helper already mounted its partition at
+# /mnt/storage, the file browser starts there automatically. Uncomment
+# to force a specific directory instead.
+#filebrowser_start_dir = "/"
+
+# Extra local-file auto-pick candidate directory ("/mnt/storage/<value>"
+# is searched for the newest matching rootfs.tar.gz/.wic), alongside
+# the usual ones.
+#local_default_dir = ""
+
+# Full URL prefix (scheme, host, port, path) pre-filling both the HTTP
+# and HTTPS source tabs. A directory-style URL (ending in "/") resolves
+# to the newest matching file at download time.
+#http_default_dir = "http://192.168.1.50:8000/builds/"
+
+kernel_target_name = "bzImage"
+
+# Shows an additional "Exit" button next to Install/Reboot - drops to
+# a console instead of rebooting - and enables F12 to save a PNG
+# screenshot of the current screen (to /mnt/storage if writable,
+# else /tmp; path is logged). Development aid, leave off for a
+# normal deployment.
+#debug_mode = false
+
+# Draws the UI into a smaller offscreen buffer at this height, then
+# upscales to the real screen - for old/weak hardware where full-
+# resolution software rendering is too slow. Try 720 or 480.
+#low_res_height = 720

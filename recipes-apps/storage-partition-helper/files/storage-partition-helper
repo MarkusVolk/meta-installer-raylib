@@ -1,0 +1,156 @@
+#!/bin/sh
+# Creates (once) and mounts a dedicated storage partition in unused
+# trailing free space on the boot disk of THIS running rescue/installer
+# system - not the target being installed. Used so large local
+# rootfs.tar.gz/.wic files have somewhere with enough room to live
+# before being selected via "Local File" in the installer. Not needed
+# for HTTPS installs, which stream directly.
+#
+# Style/technique adapted from a reference resize-helper script
+# (grows an existing partition into trailing free space); this instead
+# creates a brand-new partition there, since it must run at installer
+# time on the rescue system, not "first boot" of a newly installed
+# target.
+#
+# Uses sfdisk exclusively for partition table work (no parted): its
+# "-F --bytes" free-space report and "size=+" append syntax give exact
+# byte/sector values throughout, avoiding a round-trip through parted's
+# MiB-rounded-for-display "print free" text - which turned out to
+# occasionally produce a start value that didn't land on a valid
+# sector boundary ("closest location we can manage" errors), found via
+# real-world use of the sibling script build-payload-image.sh (same
+# technique, applied to an image file instead of a live disk).
+#
+# "partx -u" instead of "partprobe" to make the kernel re-read the
+# partition table: partprobe itself comes from the parted package,
+# which we no longer otherwise need - found the hard way (removing
+# parted broke this too). "blockdev --rereadpt" (also parted-free,
+# from util-linux) was tried first but didn't reliably create the new
+# partition's device node without udev actually running to react to
+# the resulting kernel event; "partx -u" creates it directly and
+# doesn't depend on udev being present.
+
+set -e
+
+LABEL="localstor"
+MOUNTPOINT="/mnt/storage"
+MIN_MIB=32768  # 32 GiB
+
+[ "$(whoami)" = "root" ] || { echo "E: You must be root"; exit 1; }
+
+SFDISK=$(command -v sfdisk) || { echo "E: You must have sfdisk"; exit 1; }
+PARTX=$(command -v partx) || { echo "E: You must have partx"; exit 1; }
+MKFS=$(command -v mkfs.ext4) || { echo "E: You must have mkfs.ext4"; exit 1; }
+BLKID=$(command -v blkid) || { echo "E: You must have blkid"; exit 1; }
+FINDMNT=$(command -v findmnt) || { echo "E: You must have findmnt"; exit 1; }
+LSBLK=$(command -v lsblk) || { echo "E: You must have lsblk"; exit 1; }
+SED=$(command -v sed) || { echo "E: You must have sed"; exit 1; }
+
+mkdir -p "$MOUNTPOINT"
+
+# Idempotent: if the partition already exists (from a previous boot,
+# or pre-baked by build-payload-image.sh into a freshly flashed
+# image), just mount it and stop. Briefly retried as a backstop: the
+# systemd unit already waits for systemd-udev-settle.service (the main
+# defense against udev not having finished processing newly discovered
+# partitions on a freshly flashed disk yet), this just covers any
+# residual timing edge case without meaningfully delaying the far more
+# common "genuinely doesn't exist yet, create a new one" first-boot
+# path (short backstop, not the primary defense - build-payload-
+# image.sh always consumes the ENTIRE appended free space for this
+# partition anyway, so even an exhausted retry here would hit "no free
+# space" below and skip, never destructively create a second partition
+# on top of the existing one).
+EXISTING=""
+for _attempt in 1 2 3 4 5; do
+    EXISTING=$(${BLKID} -L "$LABEL" 2>/dev/null || true)
+    [ -n "$EXISTING" ] && break
+    sleep 0.3
+done
+if [ -n "$EXISTING" ]; then
+    echo "Storage partition already exists ($EXISTING), mounting..."
+    mountpoint -q "$MOUNTPOINT" || mount "$EXISTING" "$MOUNTPOINT"
+    exit 0
+fi
+
+# Find the disk this rescue system itself is running from (same
+# PKNAME-based technique used elsewhere in this layer, not the
+# glob-over-/sys/block trick from the reference script - kept
+# consistent with the rest of this project instead).
+ROOT_SRC=$(${FINDMNT} / -o source -n)
+ROOT_SRC=$(realpath "$ROOT_SRC")
+DEVICE_NAME=$(${LSBLK} -no pkname "$ROOT_SRC")
+if [ -z "$DEVICE_NAME" ]; then
+    echo "E: Could not determine own boot disk (empty PKNAME for $ROOT_SRC)."
+    exit 1
+fi
+DEVICE="/dev/${DEVICE_NAME}"
+
+PART_TABLE_TYPE=$(${BLKID} -o value -s PTTYPE "${DEVICE}" 2>/dev/null || true)
+if [ "$PART_TABLE_TYPE" != "gpt" ]; then
+    echo "E: Expected a GPT partition table on ${DEVICE}, found: '${PART_TABLE_TYPE}'. Aborting."
+    exit 1
+fi
+
+# Make the true full disk size visible to sfdisk in case this was dd'd
+# from a smaller image onto larger media (backup GPT header still
+# sitting at the old, smaller disk's end otherwise).
+#
+# --no-reread: newer sfdisk refuses by default to touch a disk it
+# considers "in use" ("Checking that no-one is using this disk right
+# now ... FAILED") - but that's always true here by design, this
+# script specifically operates on the disk the running rescue system
+# itself booted from. Found on real hardware: storage-partition-helper
+# failed outright the first time it needed to actually create a new
+# partition (i.e. building the installer without a pre-baked payload).
+# --force would also work but disables ALL consistency checks, not
+# just this one - --no-reread is the targeted equivalent; we already
+# explicitly reread the table ourselves via partx -u right after
+# anyway, so sfdisk doing its own internal reread isn't needed even
+# discounting the disk-in-use check.
+${SFDISK} --no-reread --relocate gpt-bak-std "${DEVICE}"
+${PARTX} -u "${DEVICE}"
+
+FREE_LINE=$(${SFDISK} -F --bytes "${DEVICE}" 2>/dev/null | grep "^Unpartitioned space")
+if [ -z "$FREE_LINE" ]; then
+    echo "No free space found at the end of ${DEVICE} - skipping."
+    exit 0
+fi
+FREE_BYTES=$(echo "$FREE_LINE" | ${SED} -n 's/.*, \([0-9]*\) bytes,.*/\1/p')
+FREE_SIZE_MIB=$((FREE_BYTES / 1024 / 1024))
+
+if [ "$FREE_SIZE_MIB" -lt "$MIN_MIB" ]; then
+    echo "Only ${FREE_SIZE_MIB}MiB free at the end of ${DEVICE}, need at least ${MIN_MIB}MiB - skipping."
+    exit 0
+fi
+
+echo "Creating new partition on ${DEVICE} (${FREE_SIZE_MIB}MiB available)..."
+echo "size=+, type=L" | ${SFDISK} --no-reread -a "${DEVICE}"
+${PARTX} -u "${DEVICE}"
+
+# Find the device node of the partition just created: highest-numbered
+# partition on this disk after the refresh above.
+NEWPART=$(${SFDISK} -d "${DEVICE}" | grep '^/dev/' | tail -n 1 | cut -d: -f1 | tr -d ' ')
+
+if [ ! -b "$NEWPART" ]; then
+    echo "E: New partition ${NEWPART} not found after creation."
+    exit 1
+fi
+
+echo "Formatting ${NEWPART} as ext4 (label ${LABEL})..."
+${MKFS} -F -L "$LABEL" "$NEWPART"
+
+mount "$NEWPART" "$MOUNTPOINT"
+# 1777 (sticky bit, like /tmp): this partition is meant to be written
+# to not just by this rescue system's own root-run app, but also
+# directly by a regular desktop user - e.g. plugging the USB stick
+# into a desktop system after it already created this partition once,
+# to drag-and-drop a rootfs.tar.gz/.wic onto it without needing
+# build-payload-image.sh. ext4 (unlike FAT/NTFS) keeps real on-disk
+# Unix permissions, so udisks2/gvfs on that desktop respects whatever
+# was set here - mkfs.ext4's default (root:root 0755) would otherwise
+# leave a non-root desktop user with read-only access. Sticky bit
+# still prevents one user from deleting another's files if multiple
+# people share the same stick.
+chmod 1777 "$MOUNTPOINT"
+echo "Storage partition ready at ${MOUNTPOINT}."

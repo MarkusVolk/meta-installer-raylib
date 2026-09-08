@@ -1,0 +1,95 @@
+Subject: [PATCH] DRM: apply shift state when producing charPressedQueue
+ entries
+
+PollKeyboardEvents() had a pre-existing, upstream-acknowledged
+TODO/FIXME: evkeyToUnicodeLUT[event.code] is a static, unshifted-only
+lookup table, so charPressedQueue (what GuiTextBox()/GetCharPressed()
+actually consume for text input) never produced uppercase letters or
+shifted symbols regardless of Shift key state - confirmed always
+reproducible (not a hotplug/timing issue at all, despite initially
+looking like one, per real hardware testing) and confirmed to affect
+both the disk-backed and initramfs image variants equally, since both
+share this same raylib build.
+
+Adds a standard US-QWERTY shift transform, applied only to the
+charPressedQueue entry (raw keycodes/currentKeyState, used for
+non-text-input purposes like keyboard shortcuts, are untouched -
+Shift as a modifier for those continues to work via
+IsKeyDown(KEY_LEFT_SHIFT)/(KEY_RIGHT_SHIFT) exactly as before, this
+patch only affects what character text fields receive).
+
+Verified: the shift-transform function itself tested in isolation
+against all 21 US-QWERTY digit/punctuation pairs plus letter
+case-folding plus already-uppercase/unmapped/space pass-through (27
+cases total, all passing). Full file compiles cleanly with this
+change applied on top of the existing multi-keyboard-fd patch.
+
+Upstream-Status: Pending
+
+diff --git a/src/platforms/rcore_drm.c b/src/platforms/rcore_drm.c
+index 2380194e..8a0ac678 100644
+--- a/src/platforms/rcore_drm.c
++++ b/src/platforms/rcore_drm.c
+@@ -193,6 +193,46 @@ static const int evkeyToUnicodeLUT[] = {
+     // LUT currently incomplete, only mapped the most essential keys
+ };
+ 
++// PATCH: evkeyToUnicodeLUT above is unshifted-only (pre-existing
++// upstream TODO/FIXME on the line that uses it) - this applies a
++// standard US-QWERTY shift transform on top of it, so text fields
++// (GuiTextBox()/GetCharPressed()) can actually produce uppercase
++// letters and shifted symbols. Letters: simple case-fold. Digit row
++// and punctuation: explicit unshifted->shifted pairs, standard US
++// layout. Anything not in this table (already-uppercase-range
++// values, control characters, unmapped/0 entries) is returned
++// unchanged - deliberately conservative rather than guessing.
++static int ApplyShiftToUnicodeChar(int ch)
++{
++    if (ch >= 'a' && ch <= 'z') return ch - 32;
++    switch (ch)
++    {
++        case '1': return '!';
++        case '2': return '@';
++        case '3': return '#';
++        case '4': return '$';
++        case '5': return '%';
++        case '6': return '^';
++        case '7': return '&';
++        case '8': return '*';
++        case '9': return '(';
++        case '0': return ')';
++        case '-': return '_';
++        case '=': return '+';
++        case '[': return '{';
++        case ']': return '}';
++        case ';': return ':';
++        case '\'': return '"';
++        case '`': return '~';
++        case '\\': return '|';
++        case ',': return '<';
++        case '.': return '>';
++        case '/': return '?';
++        default: return ch;
++    }
++}
++
++
+ // This is the map used to map any keycode returned from linux to a raylib code from 'raylib.h'
+ // NOTE: Use short here to save a little memory
+ static const short linuxToRaylibMap[KEYMAP_SIZE] = {
+@@ -2239,8 +2279,13 @@ static void PollKeyboardEvents(void)
+ 
+                     if (CORE.Input.Keyboard.charPressedQueueCount < MAX_CHAR_PRESSED_QUEUE)
+                     {
+-                        // TODO/FIXME: This is not actually converting to unicode properly because it's not taking things like shift into account
+-                        CORE.Input.Keyboard.charPressedQueue[CORE.Input.Keyboard.charPressedQueueCount] = evkeyToUnicodeLUT[event.code];
++                        // PATCH: shift now applied via ApplyShiftToUnicodeChar() above -
++                        // checks raylib's own, already-updated-by-this-function keyboard
++                        // state, not a separate/duplicate tracking mechanism.
++                        int unicodeCh = evkeyToUnicodeLUT[event.code];
++                        if (CORE.Input.Keyboard.currentKeyState[KEY_LEFT_SHIFT] || CORE.Input.Keyboard.currentKeyState[KEY_RIGHT_SHIFT])
++                            unicodeCh = ApplyShiftToUnicodeChar(unicodeCh);
++                        CORE.Input.Keyboard.charPressedQueue[CORE.Input.Keyboard.charPressedQueueCount] = unicodeCh;
+                         CORE.Input.Keyboard.charPressedQueueCount++;
+                     }
+                 }

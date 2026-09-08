@@ -1,0 +1,33 @@
+[Unit]
+Description=Yocto RootFS Updater (raylib/raygui, PLATFORM_DRM)
+After=systemd-user-sessions.service
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
+[Service]
+Type=simple
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+
+# Defense in depth for the WiFi passphrase this app briefly holds in
+# its own process memory (g_wifi_screen.password_buf, main.cpp) while
+# the password-entry screen is in use - a crash during that window
+# could otherwise write it straight to disk in a core dump. Belt and
+# braces beyond this project's own systemd bbappend already disabling
+# the "coredump" PACKAGECONFIG entirely (systemd-coredump wouldn't
+# even be present to capture one) - the plain kernel default
+# (/proc/sys/kernel/core_pattern, independent of systemd-coredump)
+# could still write a bare "core" file via this process's own
+# RLIMIT_CORE otherwise, regardless of that. Found while reviewing
+# this whole flow for a direct security report about the same
+# password appearing elsewhere (the on-screen log).
+LimitCORE=0
+
+ExecStart=/usr/bin/yocto-rootfs-updater-raylib
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+# Copy to ~/.config/build-payload-image.conf (or point
+# BUILD_PAYLOAD_IMAGE_CONFIG at a different location) - sourced
+# automatically by build-payload-image.sh. Plain shell KEY=VALUE, not
+# TOML - unrelated to the target app's own config.toml.
+
+# Fixed output location for combined images, instead of next to the
+# input .wic by default:
+#payload_output_dir="/home/you/images-with-payload"
+
+# Auto-discover payload files (*.rootfs.tar.gz / *.wic) here via
+# Yocto's stable deploy symlinks - typically the tmp/deploy/images/
+# <machine>/ of a DIFFERENT build (your actual target system, not this
+# installer). <machine> is your real MACHINE name (e.g.
+# "intel-corei7-64"), not the shorter TUNE_PKGARCH shown elsewhere -
+# check with: ls <build-dir>/tmp/deploy/images/
+#payload_source_dir="/home/you/build-target/tmp/deploy/images/intel-corei7-64"
+
+# Kernel image isn't auto-discovered by default (filenames vary by
+# architecture) - opt in with the exact stable deploy symlink name for
+# your MACHINE, typically "bzImage" for x86:
+#kernel_target_name="bzImage"

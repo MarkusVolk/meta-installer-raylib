@@ -1,0 +1,31 @@
+# Triggers a per-device systemd service (usb-automount@.service) for
+# every USB-attached block device PARTITION that appears - covers
+# ordinary USB flash drives (sda1, sdb2, ... - the common case for
+# this project's own rescue/installer use). Deliberately matches
+# partitions (trailing digit), not whole disks - mounting a raw,
+# unpartitioned disk isn't something this project's own file-browsing/
+# auto-select logic expects to find directly.
+#
+# SUBSYSTEMS=="usb" (plural - walks the device's own ANCESTOR chain,
+# not just the device's own immediate ENV{ID_BUS} property) rather
+# than ENV{ID_BUS}=="usb" - found via a real report: a USB-attached
+# SSD using a USB-to-SCSI/UAS bridge chip presents its block device
+# under the "scsi" subsystem directly, with ID_BUS often left unset or
+# not reporting "usb" for that immediate device at all, even though a
+# USB device genuinely sits further up its own device tree. Dropping
+# the USB check entirely (the first workaround tried) fixed that case
+# but then also matched a genuinely internal SATA drive, which has no
+# USB ancestor anywhere in its own tree at all - SUBSYSTEMS=="usb"
+# correctly distinguishes both cases at once, and is itself the same,
+# standard idiom systemd's own real udev rules use for this exact
+# purpose (confirmed directly in the real source, 60-persistent-
+# storage.rules.in: "KERNEL==\"sd*[!0-9]|sr*\", SUBSYSTEMS==\"usb\",
+# IMPORT{builtin}=\"usb_id\"" - practically the same match this rule
+# itself makes).
+#
+# SYSTEMD_WANTS (not a direct RUN+= mount here) - lets systemd own the
+# actual mount's lifecycle (start/stop, ordering, logging via the
+# journal) rather than a bare, untracked udev RUN+= script, and keeps
+# the actual mount logic in one place (the service's own ExecStart)
+# instead of duplicated between a udev-invoked script and a service.
+SUBSYSTEM=="block", KERNEL=="sd[a-z][0-9]", SUBSYSTEMS=="usb", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="usb-automount@%k.service"

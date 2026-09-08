@@ -1,0 +1,118 @@
+#!/bin/sh
+# Mounts a "home"-labeled partition, found on the SAME disk this
+# system itself booted from, at /mnt/storage - the initramfs image's
+# own, much smaller replacement for storage-partition-helper (which
+# additionally creates/grows a dedicated partition - unneeded and
+# explicitly dropped here, this only finds and mounts an ALREADY-
+# existing one).
+#
+# "Same disk this system booted from" cannot be answered by looking at
+# the root filesystem's own backing device here (the usual approach,
+# see backend::disk_containing_path() in the app itself and bootctl's
+# own "-RR" flag) - this image's root IS a tmpfs (see this project's
+# own README entry on the initramfs image's systemd rewrite), with no
+# real block device backing it at all. Answered instead via systemd-
+# boot's own LoaderDevicePartUUID EFI variable - set by the boot
+# loader itself to the partition it was actually loaded FROM,
+# independent of whatever the CURRENT root filesystem happens to be.
+# Confirmed directly against the real systemd source (src/boot/
+# stub.c, src/gpt-auto-generator/gpt-auto-generator.c - the latter
+# uses this exact same variable for its own, similar "find a partition
+# on the boot disk" logic) rather than assumed.
+#
+# EFI variable GUID (4a67b082-0a4c-41cf-b6c7-440b29bb8c4f) confirmed
+# directly against the real systemd source too (src/boot/
+# efi-efivars.h's own LOADER_GUID definition), not guessed at.
+#
+# UTF-16LE decoding done with plain "tr -d '\000'" rather than iconv:
+# every character in a UUID string is plain ASCII, and UTF-16LE
+# encodes each ASCII character as itself followed by a single zero
+# byte - stripping all zero bytes is exactly equivalent to a real
+# UTF-16LE-to-ASCII decode for this specific, ASCII-only case, without
+# needing iconv as an extra dependency for a minimal initramfs image.
+# Verified directly against a real, constructed test file before
+# relying on it, not just reasoned about.
+set -e
+
+MOUNTPOINT="/mnt/storage"
+LABEL="home"
+EFIVARS_DIR="/sys/firmware/efi/efivars"
+EFIVAR="${EFIVARS_DIR}/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+
+# The kernel exposes /sys/firmware/efi/efivars as a mountpoint
+# (present automatically on a UEFI boot), but the special efivarfs
+# filesystem actually needs to be MOUNTED onto it before any of the
+# individual variable files underneath become readable - a full
+# systemd system normally does this automatically (its own generator/
+# mount unit for exactly this path), but this minimal initramfs image
+# doesn't currently pull that in. Found via a real boot test: the
+# directory existed but was completely empty, "mount | grep efivar"
+# showed nothing - not "genuinely not UEFI" as this script's own
+# earlier fallback message assumed, just not mounted yet. Attempted
+# directly here instead of depending on any particular systemd unit
+# being present - "|| true" since this legitimately fails/is
+# unavailable on a real non-UEFI (BIOS) boot, which isn't an error.
+# Source string and mount flags (nosuid,noexec,nodev) match systemd's
+# own core mount-setup code exactly (confirmed directly in the real
+# source, src/shared/mount-setup.c's own efivarfs entry - same source
+# string, same type, same flags), not just "some options that happen
+# to work".
+mount -t efivarfs efivarfs -o nosuid,noexec,nodev "$EFIVARS_DIR" 2>/dev/null || true
+
+if ! [ -r "$EFIVAR" ]; then
+    echo "I: LoaderDevicePartUUID not available (not booted via systemd-boot, or not UEFI) - nothing to mount."
+    exit 0
+fi
+
+# First 4 bytes of an EFI variable file are its own attribute flags,
+# not part of the value itself - skip them before decoding.
+BOOT_PART_UUID=$(tail -c +5 "$EFIVAR" | tr -d '\000')
+if [ -z "$BOOT_PART_UUID" ]; then
+    echo "I: could not decode LoaderDevicePartUUID - nothing to mount."
+    exit 0
+fi
+# Lowercased - found via a real boot test: systemd-boot writes this
+# EFI variable's value in UPPERCASE, but blkid's own "-t PARTUUID="
+# lookup (confirmed directly in the real util-linux source,
+# evaluate_by_udev() in libblkid/src/evaluate.c) works by directly
+# stat()'ing "/dev/disk/by-partuuid/<value>" - a plain, case-SENSITIVE
+# filesystem path lookup, no string-comparison/normalization step at
+# all - and udev creates those symlinks in lowercase. Without this,
+# blkid would report "no device found" even though the UUID itself,
+# character-for-character ignoring case, was completely correct -
+# exactly what was observed on real hardware before this fix.
+BOOT_PART_UUID=$(echo "$BOOT_PART_UUID" | tr 'A-F' 'a-f')
+
+BOOT_PART_DEV=$(blkid -o device -t PARTUUID="$BOOT_PART_UUID" 2>/dev/null | head -1)
+if [ -z "$BOOT_PART_DEV" ]; then
+    echo "I: no block device found for PARTUUID=$BOOT_PART_UUID - nothing to mount."
+    exit 0
+fi
+
+BOOT_DISK_NAME=$(lsblk -no PKNAME "$BOOT_PART_DEV" 2>/dev/null)
+if [ -z "$BOOT_DISK_NAME" ]; then
+    echo "I: could not determine the parent disk of $BOOT_PART_DEV - nothing to mount."
+    exit 0
+fi
+
+# Search every partition on that SAME disk (not any other disk that
+# might also happen to have a "home"-labeled partition) for the one
+# actually labeled "home".
+HOME_DEV=""
+for CANDIDATE in "/dev/${BOOT_DISK_NAME}"*; do
+    [ -b "$CANDIDATE" ] || continue
+    CANDIDATE_LABEL=$(blkid -o value -s LABEL "$CANDIDATE" 2>/dev/null || true)
+    if [ "$CANDIDATE_LABEL" = "$LABEL" ]; then
+        HOME_DEV="$CANDIDATE"
+        break
+    fi
+done
+
+if [ -z "$HOME_DEV" ]; then
+    echo "I: no partition labeled \"$LABEL\" found on boot disk (/dev/$BOOT_DISK_NAME) - nothing to mount."
+    exit 0
+fi
+
+mkdir -p "$MOUNTPOINT"
+mount -o ro "$HOME_DEV" "$MOUNTPOINT"
+echo "Mounted $HOME_DEV (label \"$LABEL\", boot disk /dev/$BOOT_DISK_NAME) at $MOUNTPOINT."

@@ -1,0 +1,25 @@
+[Unit]
+Description=Mount home partition on the boot disk at /mnt/storage
+# Ensures all partitions on the boot disk have actually been
+# discovered/processed by udev before this searches for the "home"-
+# labeled one among them - the same kind of timing concern storage-
+# partition-helper's own service unit (on the disk-backed image) waits
+# on too.
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+# Runs before the app itself, which reads local files from
+# /mnt/storage once it's up - simpler, standard-dependencies ordering
+# against that one specific unit, rather than trying to slot this into
+# the earliest possible (sysinit.target, DefaultDependencies=no)
+# boot phase, which isn't actually needed here and is more failure-
+# prone to get right than it's worth for this.
+Before=yocto-rootfs-updater-raylib.service
+ConditionPathExists=/sys/firmware/efi/efivars
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/initramfs-home-mount
+
+[Install]
+WantedBy=multi-user.target

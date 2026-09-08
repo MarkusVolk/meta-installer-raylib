@@ -1,0 +1,233 @@
+Subject: [PATCH] DRM: poll all mouse-classified evdev devices, not just the
+ last match
+
+ConfigureEvdevDevice()'s mouse-vs-touch priority logic had this rule
+for two non-touch mouse devices: "Current is mouse, new is mouse? Use
+the new one" - meaning each newly found mouse-classified device closed
+and overwrote the previous one, so whichever mouse-like device was
+enumerated LAST always won, regardless of whether it actually produced
+real movement/click events. Confirmed on real hardware: a physical USB
+mouse not working at all on one machine, while working fine on
+another - consistent with readdir() enumeration order (not guaranteed
+stable/predictable) happening to put a non-functional device last on
+the affected machine.
+
+Same underlying pattern as the existing 0001 multi-keyboard-fd patch,
+applied to mice instead: turns platform.mouseFd into an array
+(mouseFds[]/mouseFdCount) for non-touch mouse devices specifically,
+and polls all of them in PollMouseEvents() instead of only the last
+one found.
+
+Touch devices are deliberately NOT included in this change - they keep
+the original single-fd/"last one wins" behaviour via platform.mouseFd,
+and their existing priority over regular mice (touch always wins if
+both are present, in either enumeration order) is preserved exactly as
+before - only the specific "which one of possibly several actual mouse
+devices gets used" decision changes.
+
+Verified: the touch-vs-mouse priority/exclusivity decision logic
+tested in isolation against 4 scenarios (multiple mice all accepted
+and polled; touch arriving after mice correctly discards the mice;
+mouse arriving after touch correctly gets ignored; multiple touch
+devices still follow the original last-one-wins behaviour) - all
+passing. Full file (with 0001 and 0002 already applied) compiles
+cleanly, and the app links and starts without crashing against the
+resulting library.
+
+Upstream-Status: Pending
+
+diff --git a/src/platforms/rcore_drm.c b/src/platforms/rcore_drm.c
+index 8a0ac678..fd3c31e1 100644
+--- a/src/platforms/rcore_drm.c
++++ b/src/platforms/rcore_drm.c
+@@ -142,9 +142,22 @@ typedef struct {
+     // NOTE: currentButtonState[] can't be written directly due to multithreading, app could miss the update
+     char currentButtonStateEvdev[MAX_MOUSE_BUTTONS]; // Holds the new mouse state for the next polling event to grab
+     bool cursorRelative;                // Relative cursor mode
+-    int mouseFd;                        // File descriptor for the evdev mouse/touch/gestures
++    int mouseFd;                        // File descriptor for the evdev touch/gesture device (touch devices only from here on - see mouseFds[] below for regular mice)
+     bool mouseIsTouch;                  // Check if the current mouse device is actually a touchscreen
+     Rectangle absRange;                 // Range of values for absolute pointing devices (touchscreens)
++    // PATCH: mehrere gleichzeitig als (nicht-Touch-)Maus erkannte
++    // evdev-Interfaces pollen statt nur das zuletzt gefundene zu
++    // behalten (vorheriges Verhalten: jedes neue erkannte Maus-Geraet
++    // schloss und ueberschrieb das vorherige - auf mancher Hardware
++    // gewann so ein zusaetzliches, nicht funktionierendes Interface
++    // ueber die echte Maus, je nach Aufzaehlungsreihenfolge). Touch-
++    // Geraete bleiben bei der bisherigen Einzel-fd/"letztes gewinnt"-
++    // Logik ueber platform.mouseFd - deren Prioritaet gegenueber
++    // regulaeren Maeusen (Touch gewinnt, falls beide vorhanden) bleibt
++    // unveraendert.
++    #define MAX_MOUSE_FDS 8
++    int mouseFds[MAX_MOUSE_FDS];
++    int mouseFdCount;
+     int touchSlot;                      // Hold the touch slot number of the currently being sent multitouch block
+     bool touchActive[MAX_TOUCH_POINTS]; // Track which touch points are currently active
+     Vector2 touchPosition[MAX_TOUCH_POINTS]; // Track touch positions for each slot
+@@ -1763,6 +1776,11 @@ void ClosePlatform(void)
+         close(platform.mouseFd);
+         platform.mouseFd = -1;
+     }
++    for (int i = 0; i < platform.mouseFdCount; i++)
++    {
++        if (platform.mouseFds[i] != -1) close(platform.mouseFds[i]);
++    }
++    platform.mouseFdCount = 0;
+ 
+     for (int i = 0; i < platform.gamepadCount; i++)
+     {
+@@ -1956,6 +1974,8 @@ static void InitEvdevInput(void)
+     platform.keyboardFdCount = 0;
+     for (int i = 0; i < MAX_KEYBOARD_FDS; i++) platform.keyboardFds[i] = -1;
+     platform.mouseFd = -1;
++    platform.mouseFdCount = 0;
++    for (int i = 0; i < MAX_MOUSE_FDS; i++) platform.mouseFds[i] = -1;
+ 
+     // Reset variables
+     for (int i = 0; i < MAX_TOUCH_POINTS; i++)
+@@ -2130,34 +2150,70 @@ static void ConfigureEvdevDevice(char *device)
+     }
+ 
+     const char *deviceKindStr = "unknown";
+-    if (isMouse || isTouch)
+-    {
+-        bool prioritize = false;
+-
+-        // Priority logic: touchscreens override Mice
+-        // 1. No device set yet? Take it
+-        if (platform.mouseFd == -1) prioritize = true;
+-        // 2. Current is mouse, new is touch? Upgrade to touch
+-        else if (isTouch && !platform.mouseIsTouch) prioritize = true;
+-        // 3. Current is touch, new is touch? Use the new one (last one found wins, standard behavior)
+-        else if (isTouch && platform.mouseIsTouch) prioritize = true;
+-        // 4. Current is mouse, new is mouse? Use the new one
+-        else if (!isTouch && !platform.mouseIsTouch) prioritize = true;
+-        // 5. Current is touch, new is mouse? Ignore the mouse, keep the touchscreen
+-        else prioritize = false;
+-
+-        if (prioritize)
++    if (isTouch)
++    {
++        // Touch always takes priority over regular mice - matches this
++        // function's original design intent ("touchscreens override
++        // mice"). If non-touch mice were already collected below,
++        // discard them now that a touchscreen has actually been found.
++        if (platform.mouseFdCount > 0)
+         {
+-            deviceKindStr = isTouch? "touchscreen" : "mouse";
+-
+-            if (platform.mouseFd != -1)
++            TRACELOG(LOG_INFO, "INPUT: Touchscreen found - discarding %d previously found mouse device(s)", platform.mouseFdCount);
++            for (int i = 0; i < platform.mouseFdCount; i++)
+             {
+-                TRACELOG(LOG_INFO, "INPUT: Overwriting previous input device with new %s", deviceKindStr);
+-                close(platform.mouseFd);
++                if (platform.mouseFds[i] != -1) close(platform.mouseFds[i]);
++                platform.mouseFds[i] = -1;
+             }
++            platform.mouseFdCount = 0;
++        }
++
++        if (platform.mouseFd != -1)
++        {
++            TRACELOG(LOG_INFO, "INPUT: Overwriting previous input device with new touchscreen");
++            close(platform.mouseFd);
++        }
++
++        deviceKindStr = "touchscreen";
++        platform.mouseFd = fd;
++        platform.mouseIsTouch = true;
++
++        if (absAxisCount > 0)
++        {
++            platform.absRange.x = absinfo[ABS_X].info.minimum;
++            platform.absRange.width = absinfo[ABS_X].info.maximum - absinfo[ABS_X].info.minimum;
++
++            platform.absRange.y = absinfo[ABS_Y].info.minimum;
++            platform.absRange.height = absinfo[ABS_Y].info.maximum - absinfo[ABS_Y].info.minimum;
++        }
+ 
+-            platform.mouseFd = fd;
+-            platform.mouseIsTouch = isTouch;
++        TRACELOG(LOG_INFO, "INPUT: Initialized input device %s as %s", device, deviceKindStr);
++    }
++    else if (isMouse)
++    {
++        // A touchscreen already claims exclusivity - matches this
++        // function's original design ("ignore the mouse, keep the
++        // touchscreen").
++        if (platform.mouseFd != -1 && platform.mouseIsTouch)
++        {
++            TRACELOG(LOG_INFO, "INPUT: Ignoring mouse device %s (keeping higher priority touchscreen device)", device);
++            close(fd);
++            return;
++        }
++
++        // PATCH: poll all mouse-classified devices, not just the last
++        // one found - previously each new mouse-like device closed
++        // and overwrote the previous one, so on hardware where more
++        // than one device satisfies the isMouse heuristic (e.g. an
++        // extra HID sub-interface alongside the real mouse), whichever
++        // happened to enumerate last "won" regardless of whether it
++        // actually produced real movement/click events - confirmed on
++        // real hardware (a real mouse simply not working at all on one
++        // machine). Same underlying pattern as the existing multi-
++        // keyboard-fd patch, applied to mice.
++        if (platform.mouseFdCount < MAX_MOUSE_FDS)
++        {
++            platform.mouseFds[platform.mouseFdCount] = fd;
++            platform.mouseFdCount++;
+ 
+             if (absAxisCount > 0)
+             {
+@@ -2168,11 +2224,11 @@ static void ConfigureEvdevDevice(char *device)
+                 platform.absRange.height = absinfo[ABS_Y].info.maximum - absinfo[ABS_Y].info.minimum;
+             }
+ 
+-            TRACELOG(LOG_INFO, "INPUT: Initialized input device %s as %s", device, deviceKindStr);
++            TRACELOG(LOG_INFO, "INPUT: Initialized input device %s as mouse", device);
+         }
+         else
+         {
+-            TRACELOG(LOG_INFO, "INPUT: Ignoring device %s (keeping higher priority %s device)", device, platform.mouseIsTouch ? "touchscreen" : "mouse");
++            TRACELOG(LOG_WARNING, "INPUT: Too many mouse-classified devices found (max %d), ignoring %s", MAX_MOUSE_FDS, device);
+             close(fd);
+             return;
+         }
+@@ -2351,8 +2407,26 @@ static void PollGamepadEvents(void)
+ // Poll mouse input events
+ static void PollMouseEvents(void)
+ {
+-    int fd = platform.mouseFd;
+-    if (fd == -1) return;
++    // PATCH: poll the touch fd (if any, still single-device as before)
++    // AND all mouse-classified fds (now potentially several, see the
++    // struct comment on mouseFds[]/ConfigureEvdevDevice() above) -
++    // built into one local array so the existing, unmodified body
++    // below (touch/multitouch/button handling, all left exactly as
++    // designed) just runs once per relevant fd, same wrapping pattern
++    // as the existing multi-keyboard-fd patch.
++    #define MAX_POLL_MOUSE_FDS (1 + MAX_MOUSE_FDS)
++    int pollFds[MAX_POLL_MOUSE_FDS];
++    int pollFdCount = 0;
++    if (platform.mouseFd != -1) pollFds[pollFdCount++] = platform.mouseFd;
++    for (int i = 0; i < platform.mouseFdCount; i++)
++    {
++        if (platform.mouseFds[i] != -1) pollFds[pollFdCount++] = platform.mouseFds[i];
++    }
++    if (pollFdCount == 0) return;
++
++    for (int pollIdx = 0; pollIdx < pollFdCount; pollIdx++)
++    {
++    int fd = pollFds[pollIdx];
+ 
+     struct input_event event = { 0 };
+     int touchAction = -1;           // 0-TOUCH_ACTION_UP, 1-TOUCH_ACTION_DOWN, 2-TOUCH_ACTION_MOVE
+@@ -2627,6 +2701,7 @@ static void PollMouseEvents(void)
+         }
+ #endif
+     }
++    } // Ende PATCH-Schleife ueber pollFds[] (Touch-fd + alle Maus-fds)
+ }
+ 
+ // Search matching DRM mode in connector's mode list

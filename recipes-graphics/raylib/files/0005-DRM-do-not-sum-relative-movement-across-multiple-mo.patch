@@ -1,0 +1,117 @@
+Subject: [PATCH] DRM: do not sum relative movement across multiple mouse
+ fds
+
+The stock code accumulates relative movement additively
+("CORE.Input.Mouse.currentPosition.x += event.value") - correct for a
+single mouse fd, but once the 0003 patch started polling multiple
+mouse-classified fds per call, any additional device that ALSO reports
+movement for the same physical motion (a second, redundant HID
+interface of the same physical mouse, or a genuinely separate second
+pointing device both actually present) gets its deltas summed into the
+SAME shared position, moving the cursor further/faster than the real
+physical motion.
+
+Confirmed via a real regression report: double-click in the file
+browser (main.cpp, its own position+timing based detection - see that
+file's own comments on why it doesn't rely on raygui's built-in
+active-item toggling) stopped recognizing genuine double-clicks after
+the 0003 patch - the two clicks of a double-click landing at
+inconsistently different accumulated positions fails that detection's
+own "same spot" (6px) check.
+
+Only one fd's relative movement is now allowed to actually update the
+cursor position per PollMouseEvents() call - whichever fd reports
+movement first in that call "wins" for the whole call, others'
+REL_X/REL_Y deltas are ignored. Button/wheel/key events are
+deliberately NOT gated the same way - those are boolean/discrete
+assignments, not accumulative, so duplicate reports from multiple fds
+aren't the same class of problem. EV_ABS (absolute-position devices,
+e.g. touchscreens) is also left untouched - it directly assigns rather
+than accumulates, so a second device there simply overwrites rather
+than compounds, which isn't a regression from the 0003 patch's own
+"poll all, no additional ordering guarantee" design.
+
+Verified: the core guard logic (only the first fd per call updates
+position, a duplicate-reporting second fd is ignored, whichever fd
+reports first "wins" regardless of its position in the poll order)
+tested in isolation against 3 scenarios - all passing. Full file (with
+0001-0004 already applied) compiles cleanly, and the app links and
+starts without crashing against the resulting library.
+
+Upstream-Status: Pending
+
+diff --git a/src/platforms/rcore_drm.c b/src/platforms/rcore_drm.c
+index 93edd6d5..2dcf0fff 100644
+--- a/src/platforms/rcore_drm.c
++++ b/src/platforms/rcore_drm.c
+@@ -2511,6 +2511,28 @@ static void PollMouseEvents(void)
+     }
+     if (pollFdCount == 0) return;
+ 
++    // PATCH: only let ONE fd's relative movement (REL_X/REL_Y) actually
++    // update the cursor position per call, not every polled fd summed
++    // together. Found via a real regression report: double-click in
++    // the file browser (main.cpp, its own position+timing based
++    // detection, see that file's comments) stopped recognizing genuine
++    // double-clicks after this multi-mouse-fd patch. Root cause: the
++    // stock code below accumulates relative movement ADDITIVELY
++    // ("CORE.Input.Mouse.currentPosition.x += event.value") - fine for
++    // a single fd, but once multiple mouse-classified fds are polled
++    // in the same call (this patch's whole point), any device that
++    // ALSO reports movement for the same physical motion - a second,
++    // redundant HID interface of the same physical mouse, or a
++    // genuinely separate second pointing device both actually present
++    // - gets its deltas summed into the SAME shared position, moving
++    // the cursor further/faster than the real physical motion and
++    // making the two clicks of a double-click land at inconsistently
++    // different positions, failing the file browser's own "same spot"
++    // check. Button/wheel/key events are NOT gated the same way here
++    // (those are boolean/discrete, not accumulative, so duplicate
++    // reports from multiple fds aren't the same class of problem).
++    int active_movement_pollIdx = -1;
++
+     for (int pollIdx = 0; pollIdx < pollFdCount; pollIdx++)
+     {
+     int fd = pollFds[pollIdx];
+@@ -2527,12 +2549,16 @@ static void PollMouseEvents(void)
+         {
+             if (event.code == REL_X)
+             {
+-                if (platform.cursorRelative)
++                if (active_movement_pollIdx == -1 || active_movement_pollIdx == pollIdx)
+                 {
+-                    CORE.Input.Mouse.currentPosition.x = event.value;
+-                    CORE.Input.Mouse.previousPosition.x = 0.0f;
++                    active_movement_pollIdx = pollIdx;
++                    if (platform.cursorRelative)
++                    {
++                        CORE.Input.Mouse.currentPosition.x = event.value;
++                        CORE.Input.Mouse.previousPosition.x = 0.0f;
++                    }
++                    else CORE.Input.Mouse.currentPosition.x += event.value;
+                 }
+-                else CORE.Input.Mouse.currentPosition.x += event.value;
+ 
+                 // NOTE: For DRM touchscreen, do not simulate touch from mouse movement
+                 // CORE.Input.Touch.position[0].x = CORE.Input.Mouse.currentPosition.x;
+@@ -2541,12 +2567,16 @@ static void PollMouseEvents(void)
+ 
+             if (event.code == REL_Y)
+             {
+-                if (platform.cursorRelative)
++                if (active_movement_pollIdx == -1 || active_movement_pollIdx == pollIdx)
+                 {
+-                    CORE.Input.Mouse.currentPosition.y = event.value;
+-                    CORE.Input.Mouse.previousPosition.y = 0.0f;
++                    active_movement_pollIdx = pollIdx;
++                    if (platform.cursorRelative)
++                    {
++                        CORE.Input.Mouse.currentPosition.y = event.value;
++                        CORE.Input.Mouse.previousPosition.y = 0.0f;
++                    }
++                    else CORE.Input.Mouse.currentPosition.y += event.value;
+                 }
+-                else CORE.Input.Mouse.currentPosition.y += event.value;
+ 
+                 // NOTE: For DRM touchscreen, do not simulate touch from mouse movement
+                 // CORE.Input.Touch.position[0].y = CORE.Input.Mouse.currentPosition.y;

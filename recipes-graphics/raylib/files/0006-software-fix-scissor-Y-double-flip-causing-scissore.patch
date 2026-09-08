@@ -1,0 +1,77 @@
+Subject: [PATCH] software: fix scissor Y double-flip causing scissored
+ content to render nowhere at all
+
+swScissor() (src/external/rlsw.h, the software rasterizer backing
+GRAPHICS_API_OPENGL_SOFTWARE) computed its own clip-space Y range
+using "1.0f - 2*y/height" - a top-down-to-NDC conversion. But the "y"
+it receives has already been converted from top-down screen space to
+bottom-up by BeginScissorMode() (src/rcore.c, shared across every
+raylib platform: "rlScissor(x, CORE.Window.currentFbo.height - (y +
+height), width, height)"), the same convention real hardware OpenGL's
+own glScissor() expects.
+
+Applying a second, independent flip on top of that already-converted
+value lands the scissor's own clip-space Y range in the opposite half
+of NDC space from where the actual geometry being scissored gets
+projected (that geometry's own screen-to-NDC conversion has no
+equivalent second flip). Confirmed directly: for a 900x700 window
+with BeginScissorMode(280, 30, 240, 140), swScissor() received
+y=530 (700 - (30+140), i.e. already bottom-up) - the old formula
+produced scClipMin/Max Y of [-0.914, -0.514] (bottom half of NDC),
+while a rectangle drawn well inside that same nominal scissor region
+(at screen Y 50-150) projects to NDC Y [0.571, 0.857] (top half) -
+zero overlap. Every vertex of scissored content then fails the
+IS_INSIDE_SCISSOR_Y_MIN/MAX test and gets discarded entirely - not
+clipped at the true edges, simply never drawn at all, regardless of
+whether it's anywhere near the scissor's actual boundary.
+
+Fixed by using the same bottom-up-to-NDC formula ("2*y/height - 1.0f")
+already used for the X axis and for the general viewport/projection
+math elsewhere in this file, instead of re-flipping an axis that
+BeginScissorMode() already flipped once.
+
+Upstream-Status: Backport [https://github.com/raysan5/raylib/commit/7a247ff40fc5e77243b6e0af856437d2e6231c31]
+
+Found and fixed independently here before discovering this - an
+upstream contributor (Thiago Mucci) had already found and fixed the
+exact same bug, merged as raylib PR #5976 on 2026-07-13, with the
+identical formula change. That fix landed after this layer's own
+pinned SRCREV (dbc56a87, which is raylib's own 6.0 release tag itself)
+and isn't included in any tagged release yet as of this writing -
+kept as a local backport rather than bumping SRCREV past the 6.0 tag
+to an untagged development commit (a materially bigger, less
+predictable jump than this one specific, already-verified line).
+Drop this patch once this project's own raylib recipe moves to a
+release that includes 7a247ff4 or later (check with
+"git merge-base --is-ancestor 7a247ff4 <new-tag>" against raylib's own
+upstream repo).
+
+diff --git a/src/external/rlsw.h b/src/external/rlsw.h
+index 8f7ab440..ac4f4351 100644
+--- a/src/external/rlsw.h
++++ b/src/external/rlsw.h
+@@ -4210,8 +4210,22 @@ void swScissor(int x, int y, int width, int height)
+ 
+     RLSW.scClipMin[0] = (2.0f*(float)RLSW.scMin[0]/(float)RLSW.vpSize[0]) - 1.0f;
+     RLSW.scClipMax[0] = (2.0f*(float)RLSW.scMax[0]/(float)RLSW.vpSize[0]) - 1.0f;
+-    RLSW.scClipMax[1] = 1.0f - (2.0f*(float)RLSW.scMin[1]/(float)RLSW.vpSize[1]);
+-    RLSW.scClipMin[1] = 1.0f - (2.0f*(float)RLSW.scMax[1]/(float)RLSW.vpSize[1]);
++    // Y flipped without a second inversion: BeginScissorMode() (rcore.c,
++    // shared across every raylib platform) already converts the
++    // incoming top-down screen Y into a bottom-up value before calling
++    // rlScissor()/here - "y" received by this function is already
++    // measured from the bottom, the same convention real hardware
++    // OpenGL's own glScissor() expects. The previous "1.0f - ..." form
++    // applied a SECOND, independent top-down-style flip on top of
++    // that already-converted value, landing the scissor's own clip-
++    // space Y range in the opposite half of NDC space from where the
++    // actual geometry being scissored gets projected (that geometry's
++    // own screen-to-NDC conversion has no equivalent second flip) -
++    // meaning content meant to be visible within the scissor region
++    // instead failed every "is this vertex inside the scissor" check
++    // and got discarded entirely, not just clipped at the true edges.
++    RLSW.scClipMin[1] = (2.0f*(float)RLSW.scMin[1]/(float)RLSW.vpSize[1]) - 1.0f;
++    RLSW.scClipMax[1] = (2.0f*(float)RLSW.scMax[1]/(float)RLSW.vpSize[1]) - 1.0f;
+ }
+ 
+ void swClearColor(float r, float g, float b, float a)

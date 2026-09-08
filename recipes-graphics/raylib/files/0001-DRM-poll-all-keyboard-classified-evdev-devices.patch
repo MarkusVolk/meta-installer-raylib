@@ -1,0 +1,102 @@
+Subject: [PATCH] DRM: poll all keyboard-classified evdev devices, not just
+ the first match
+
+InitEvdevInput() stops at the first device whose evdev capability
+bitmap matches raylib's isKeyboard heuristic and never looks further
+(platform.keyboardFd == -1 guard). On real hardware, more than one
+device can satisfy that heuristic at once - e.g. a USB
+wireless-receiver dongle (keyboard+mouse combo) alongside the actual
+physical keyboard - and whichever is enumerated first "wins",
+permanently excluding the real keyboard from ever being read.
+
+This turns platform.keyboardFd into an array of file descriptors and
+polls all of them in PollKeyboardEvents(), instead of only the first
+one found.
+
+Upstream-Status: Pending
+
+diff --git a/src/platforms/rcore_drm.c b/src/platforms/rcore_drm.c
+index 98c35f7e..2380194e 100644
+--- a/src/platforms/rcore_drm.c
++++ b/src/platforms/rcore_drm.c
+@@ -129,6 +129,13 @@ typedef struct {
+     int defaultFileFlags;               // Default IO file flags
+     struct termios defaultSettings;     // Default keyboard settings
+     int keyboardFd;                     // File descriptor for the evdev keyboard
++    // PATCH: mehrere gleichzeitig als Tastatur erkannte evdev-Interfaces
++    // pollen statt nur das erste (z. B. USB-Receiver + echte Tastatur
++    // erfuellen beide raylibs isKeyboard-Bitmaske, aber nur eines davon
++    // erzeugt beim Tippen tatsaechlich Events).
++    #define MAX_KEYBOARD_FDS 8
++    int keyboardFds[MAX_KEYBOARD_FDS];
++    int keyboardFdCount;
+ 
+     // Mouse data
+     Vector2 eventWheelMove;             // Registers the event mouse wheel variation
+@@ -1723,6 +1730,11 @@ void ClosePlatform(void)
+         platform.gamepadStreamFd[i] = -1;
+     }
+ 
++    for (int i = 0; i < platform.keyboardFdCount; i++)
++    {
++        if (platform.keyboardFds[i] != -1) close(platform.keyboardFds[i]);
++    }
++    platform.keyboardFdCount = 0;
+     if (platform.keyboardFd != -1)
+     {
+         close(platform.keyboardFd);
+@@ -1901,6 +1913,8 @@ static void InitEvdevInput(void)
+ 
+     // Initialize keyboard file descriptor
+     platform.keyboardFd = -1;
++    platform.keyboardFdCount = 0;
++    for (int i = 0; i < MAX_KEYBOARD_FDS; i++) platform.keyboardFds[i] = -1;
+     platform.mouseFd = -1;
+ 
+     // Reset variables
+@@ -2155,10 +2169,17 @@ static void ConfigureEvdevDevice(char *device)
+             }
+         }
+     }
+-    else if (isKeyboard && (platform.keyboardFd == -1))
++    else if (isKeyboard && (platform.keyboardFdCount < MAX_KEYBOARD_FDS))
+     {
++        // PATCH: nicht mehr beim ersten Treffer stehenbleiben - manche
++        // Geraete (z. B. USB-Receiver mit Maus+Tastatur-Kombi) erfuellen
++        // die isKeyboard-Bitmaske ebenfalls, erzeugen beim Tippen aber
++        // keine Events. Alle Treffer merken und in PollKeyboardEvents()
++        // gemeinsam pollen, statt nur den ersten zu nutzen.
+         deviceKindStr = "keyboard";
+-        platform.keyboardFd = fd;
++        platform.keyboardFds[platform.keyboardFdCount] = fd;
++        platform.keyboardFdCount++;
++        if (platform.keyboardFd == -1) platform.keyboardFd = fd;   // Kompatibilitaet mit uebrigem Code
+     }
+     else
+     {
+@@ -2172,8 +2193,12 @@ static void ConfigureEvdevDevice(char *device)
+ // Poll and process evdev keyboard events
+ static void PollKeyboardEvents(void)
+ {
+-    int fd = platform.keyboardFd;
+-    if (fd == -1) return;
++    // PATCH: alle als Tastatur erkannten evdev-Fds pollen, nicht nur
++    // den ersten gefundenen (siehe Kommentar bei keyboardFdCount).
++    for (int kbdIdx = 0; kbdIdx < platform.keyboardFdCount; kbdIdx++)
++    {
++    int fd = platform.keyboardFds[kbdIdx];
++    if (fd == -1) continue;
+ 
+     struct input_event event = { 0 };
+     int keycode = -1;
+@@ -2224,9 +2249,8 @@ static void PollKeyboardEvents(void)
+             }
+         }
+     }
++    } // Ende PATCH-Schleife ueber platform.keyboardFds[]
+ }
+-
+-// Poll gamepad input events
+ static void PollGamepadEvents(void)
+ {
+     // Read gamepad event

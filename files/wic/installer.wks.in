@@ -1,0 +1,14 @@
+# short-description: Bootable EFI image for the RootFS Updater installer
+# long-description: Partitioned EFI image for USB sticks (dd/bmaptool).
+# Bootloader is systemd-boot. No /home partition - this is a live/rescue
+# image, not a persistent installation. Requires EFI boot; for other
+# boot mechanisms (e.g. Raspberry Pi/u-boot) replace with the
+# appropriate wks (e.g. rpi.wks from meta-raspberrypi).
+part /boot --source bootimg-efi --sourceparams="loader=${EFI_PROVIDER}${@',initrd=${INITRAMFS_IMAGE}-${MACHINE}.${INITRAMFS_FSTYPES}' if d.getVar('INITRAMFS_IMAGE') else ''}" --label msdos --active --align 1024 --use-uuid
+part / --source rootfs --fstype=ext4 --label installer --align 1024 --use-uuid
+
+# timeout=0: this image only ever has one boot entry (the installer
+# itself), so showing a selection menu and waiting serves no purpose -
+# boots straight to it instead. systemd-boot still honors a held key
+# at boot to bring the menu up manually if ever needed.
+bootloader --ptable gpt --timeout=0 --append=" rootfstype=ext4 "

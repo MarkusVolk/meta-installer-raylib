@@ -1,0 +1,14 @@
+[Unit]
+Description=Create/mount local storage partition for large local install images
+Wants=systemd-udevd.service systemd-udev-trigger.service systemd-udev-settle.service
+DefaultDependencies=no
+After=local-fs.target systemd-udev-trigger.service systemd-udev-settle.service
+Before=yocto-rootfs-updater-raylib.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/storage-partition-helper
+
+[Install]
+WantedBy=multi-user.target
