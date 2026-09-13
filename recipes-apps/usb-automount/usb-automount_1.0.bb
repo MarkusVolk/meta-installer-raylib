@@ -29,7 +29,7 @@ SYSTEMD_SERVICE:${PN} = "usb-automount@.service"
 # a templated device-triggered service (not an oversight).
 SYSTEMD_AUTO_ENABLE:${PN} = "disable"
 
-RDEPENDS:${PN} = "${VIRTUAL-RUNTIME_dev_manager} util-linux-mount util-linux-umount util-linux-mountpoint coreutils"
+RDEPENDS:${PN} = "${VIRTUAL-RUNTIME_dev_manager} util-linux-findmnt util-linux-mount util-linux-umount util-linux-mountpoint coreutils"
 
 do_install() {
     install -d ${D}${base_libdir}/udev/rules.d

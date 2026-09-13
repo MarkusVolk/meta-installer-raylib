@@ -32,6 +32,19 @@ link_valid() {
 
 case "$ACTION" in
     mount)
+        # The disk this system booted from is a USB device too, so the udev
+        # rule fires for its own partitions as well. Its rootfs and the
+        # localstor partition storage-partition-helper handles are already
+        # mounted by the time this runs, and mounting them a second time just
+        # fails, leaving a misleading "Failed to start Auto-mount USB device
+        # sda3" on the console that reads like the storage partition was
+        # unavailable. Partitions that are not in use - the boot stick's own
+        # ESP among them - are still picked up as before.
+        IN_USE=$(findmnt -rno TARGET --source "$DEV" 2>/dev/null | head -1)
+        if [ -n "$IN_USE" ]; then
+            echo "I: $DEV is already mounted at $IN_USE - not mounting it again."
+            exit 0
+        fi
         mkdir -p "$MP"
         mount -o ro "$DEV" "$MP"
         if ! link_valid; then
