@@ -4,11 +4,24 @@
 # image, not a persistent installation. Requires EFI boot; for other
 # boot mechanisms (e.g. Raspberry Pi/u-boot) replace with the
 # appropriate wks (e.g. rpi.wks from meta-raspberrypi).
-part /boot --source bootimg-efi --sourceparams="loader=${EFI_PROVIDER}${@',initrd=${INITRAMFS_IMAGE}-${MACHINE}.${INITRAMFS_FSTYPES}' if d.getVar('INITRAMFS_IMAGE') else ''}" --label msdos --active --align 1024 --use-uuid
+# The initrd parameter reads its values with d.getVar() rather than nesting
+# variable references inside the python expression. bitbake substitutes plain
+# variables before python ones, so a variable that is not set anywhere -
+# INITRAMFS_IMAGE on a machine that does not use one - survives that first
+# pass, and its closing brace then stops the python expression from being
+# recognized as one. Its opening characters end up in the loader name and wic
+# rejects it. Note that bitbake expands these comment lines as well: they are
+# comments to wic only, so keep variable syntax out of them entirely.
+part /boot --source bootimg-efi --sourceparams="loader=${EFI_PROVIDER}${@',initrd=%s-%s.%s' % (d.getVar('INITRAMFS_IMAGE'), d.getVar('MACHINE'), d.getVar('INITRAMFS_FSTYPES')) if d.getVar('INITRAMFS_IMAGE') else ''}" --label msdos --active --align 1024 --use-uuid
 part / --source rootfs --fstype=ext4 --label installer --align 1024 --use-uuid
 
 # timeout=0: this image only ever has one boot entry (the installer
 # itself), so showing a selection menu and waiting serves no purpose -
 # boots straight to it instead. systemd-boot still honors a held key
 # at boot to bring the menu up manually if ever needed.
-bootloader --ptable gpt --timeout=0 --append=" rootfstype=ext4 "
+# rootwait is not optional here: this image is meant to boot from a USB
+# stick, and USB mass storage is enumerated asynchronously, well after the
+# kernel first looks for its root device. Without it the kernel gives up
+# immediately and panics with "no valid root filesystem found" - reproduced
+# in qemu, where the very same image boots fine off SATA and fails off USB.
+bootloader --ptable gpt --timeout=0 --append=" rootfstype=ext4 rootwait "
