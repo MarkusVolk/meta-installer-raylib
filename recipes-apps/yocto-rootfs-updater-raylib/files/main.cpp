@@ -1198,7 +1198,7 @@ struct AppState {
     PartitionSelector rootfs_sel;
     char excludes_buf[256] = "";
 
-    bool kernel_enabled = false;
+    bool kernel_enabled = true;
     PartitionSelector boot_sel;
     int kernel_source_kind = 0; // 0 = local, 1 = HTTP, 2 = HTTPS
     char kernel_local_path[512] = "";
@@ -3187,6 +3187,7 @@ int main(void) {
     if (!cfg_kernel_sha256_default.empty()) {
         strncpy(g_app.kernel_sha256, cfg_kernel_sha256_default.c_str(), sizeof(g_app.kernel_sha256) - 1);
     }
+    g_app.kernel_enabled = cfg_get("kernel_enabled_default", "true") != "false";
     g_cfg_debug_mode = cfg_get("debug_mode", "false") == "true";
     g_wifi_available = (access("/usr/bin/iwctl", X_OK) == 0);
     if (g_wifi_available) log_msg("WiFi support detected (iwctl present).");

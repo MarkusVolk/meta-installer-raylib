@@ -34,6 +34,11 @@ boot_mountpoint = "/mnt/boot"
 
 kernel_target_name = "bzImage"
 
+# The kernel image section starts enabled so that a rootfs update also
+# brings the matching kernel and the target keeps booting. Set to false
+# to start with it disabled; it stays toggleable per run either way.
+#kernel_enabled_default = true
+
 # Shows an additional "Exit" button next to Install/Reboot - drops to
 # a console instead of rebooting - and enables F12 to save a PNG
 # screenshot of the current screen (to /mnt/storage if writable,
