@@ -3,7 +3,8 @@
 # RUNNING, already-deployed system's own ESP - no ".wic" file, no
 # losetup, no mtools, unlike add-initramfs-installer-boot-entry.sh
 # (build artifact, no real system yet). Run this ON the target
-# machine itself, as root, with the kernel + initramfs.cpio.gz
+# machine itself, as a member of the disk group that owns the ESP,
+# with the kernel + initramfs.cpio.gz
 # already transferred there.
 #
 # NOT usable via this project's own "RootFS Update" app feature -
@@ -75,7 +76,6 @@ if [ -z "$INITRAMFS_ARG" ]; then
 fi
 ESP_MOUNT="${1:-/boot}"
 
-[ "$(id -u)" = "0" ] || { echo "E: must run as root (writes into ${ESP_MOUNT})." >&2; exit 1; }
 [ -f "$KERNEL_ARG" ] || { echo "E: Kernel not found: $KERNEL_ARG" >&2; exit 1; }
 [ -f "$INITRAMFS_ARG" ] || { echo "E: Initramfs not found: $INITRAMFS_ARG" >&2; exit 1; }
 
