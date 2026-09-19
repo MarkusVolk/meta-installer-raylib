@@ -738,6 +738,30 @@ static std::string find_latest_matching_file(const std::vector<std::string>& dir
 // target's boot partition). Looks for an EXACT filename match rather
 // than a "latest by mtime" scan - there's normally only one such
 // stable-symlink name to find per directory anyway.
+// Kernel that belongs to a given rootfs/wic file: "<name>-image.tar.gz"
+// (or .tgz/.wic) next to "<name>-<kernel_target_name>", the layout a
+// shared images directory with one link pair per image uses. Empty
+// if no such sibling exists.
+static std::string sibling_kernel_for(const std::string& image_path, const std::string& kernel_target) {
+    size_t slash = image_path.rfind('/');
+    std::string dir = slash == std::string::npos ? "" : image_path.substr(0, slash + 1);
+    std::string name = slash == std::string::npos ? image_path : image_path.substr(slash + 1);
+    for (const char* ext : {".rootfs.tar.gz", ".rootfs.wic", ".tar.gz", ".tgz", ".wic"}) {
+        size_t n = strlen(ext);
+        if (name.size() > n && name.compare(name.size() - n, n, ext) == 0) {
+            name.resize(name.size() - n);
+            break;
+        }
+    }
+    const std::string suffix = "-image";
+    if (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+        name.resize(name.size() - suffix.size());
+    std::string candidate = dir + name + "-" + kernel_target;
+    struct stat st{};
+    if (stat(candidate.c_str(), &st) == 0 && S_ISREG(st.st_mode)) return candidate;
+    return "";
+}
+
 static std::string find_exact_named_file(const std::vector<std::string>& dirs, const std::string& filename) {
     for (auto& dir : dirs) {
         std::string full = dir;
@@ -1783,6 +1807,14 @@ static void draw_ui() {
         text_field(1, {x, y, FORM_W - 110 * g_ui_scale, ROW}, g_app.rootfs_local_path, sizeof(g_app.rootfs_local_path));
         if (focusable_button(100, {x + FORM_W - 100 * g_ui_scale, y, 100 * g_ui_scale, ROW}, "Browse")) {
             g_app.browser.open_for(g_app.rootfs_local_path, sizeof(g_app.rootfs_local_path), g_cfg_filebrowser_start_dir.c_str(), {".tar.gz", ".tgz"});
+        }
+        // A newly picked rootfs takes its own kernel along when the
+        // sibling naming of a shared images directory applies.
+        static std::string last_rootfs_local_path;
+        if (last_rootfs_local_path != g_app.rootfs_local_path) {
+            last_rootfs_local_path = g_app.rootfs_local_path;
+            std::string k = sibling_kernel_for(last_rootfs_local_path, g_app.kernel_target_name[0] ? g_app.kernel_target_name : "bzImage");
+            if (!k.empty()) strncpy(g_app.kernel_local_path, k.c_str(), sizeof(g_app.kernel_local_path) - 1);
         }
     } else if (g_app.rootfs_source_kind == 1) {
         // Plain HTTP - deliberately no certificate/TLS involved at all
@@ -3244,7 +3276,10 @@ int main(void) {
         strncpy(g_app.wic_local_path, auto_wic.c_str(), sizeof(g_app.wic_local_path) - 1);
         log_msg("Auto-selected local wic image: " + auto_wic);
     }
-    std::string auto_kernel = find_exact_named_file(local_file_candidate_dirs, cfg_kernel_target);
+    std::string auto_kernel;
+    if (!auto_rootfs.empty()) auto_kernel = sibling_kernel_for(auto_rootfs, cfg_kernel_target);
+    if (auto_kernel.empty() && !auto_wic.empty()) auto_kernel = sibling_kernel_for(auto_wic, cfg_kernel_target);
+    if (auto_kernel.empty()) auto_kernel = find_exact_named_file(local_file_candidate_dirs, cfg_kernel_target);
     if (!auto_kernel.empty()) {
         strncpy(g_app.kernel_local_path, auto_kernel.c_str(), sizeof(g_app.kernel_local_path) - 1);
         log_msg("Auto-selected local kernel image: " + auto_kernel);
