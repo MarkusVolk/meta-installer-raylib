@@ -449,7 +449,7 @@ static bool focusable_button(int id, Rectangle rect, const char* text,
         // is used directly, matching this file's existing pattern for
         // one-off color references.
         DrawRectangleLinesEx(rect, 2 * g_ui_scale, g_focusRingColor);
-        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE)) clicked = true;
+        if (!GuiIsLocked() && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE))) clicked = true;
     }
     return clicked;
 }
@@ -515,7 +515,7 @@ static void focusable_toggle_group(int id_base, Rectangle rect, const char* text
             // own comment on the thickness-not-color contrast
             // decision.
             DrawRectangleLinesEx(item_rect, 2 * g_ui_scale, g_focusRingColor);
-            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE)) {
+            if (!GuiIsLocked() && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE))) {
                 *mode = i;
             }
         }
@@ -546,7 +546,7 @@ static void filled_checkbox(int id, Rectangle rect, const char* text, bool* chec
         // Lilac, not mint green - see focusable_button()'s own
         // comment on the thickness-not-color contrast decision.
         DrawRectangleLinesEx(rect, 2 * g_ui_scale, g_focusRingColor);
-        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE)) *checked = !*checked;
+        if (!GuiIsLocked() && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE))) *checked = !*checked;
     }
 }
 
@@ -1717,6 +1717,8 @@ static std::string current_source_display(int source_kind, const char* local_pat
 static void draw_ui() {
     float sw = (float)g_canvas_w, sh = (float)g_canvas_h;
     g_field_order.clear();
+    bool modal_open = g_app.browser.open || g_dir_picker_active || g_app.show_confirm || g_wifi_screen.active;
+    if (modal_open) GuiLock();
 
     bool worker_active;
     int progress_pct;
@@ -2155,7 +2157,7 @@ static void draw_ui() {
     if (max_scroll < 0) max_scroll = 0;
     if (max_scroll > 0) {
         Rectangle form_rect = {0, 0, FORM_PANEL_W, sh};
-        if (CheckCollisionPointRec(GetMousePosition(), form_rect)) {
+        if (!modal_open && CheckCollisionPointRec(GetMousePosition(), form_rect)) {
             g_form_scroll -= GetMouseWheelMove() * 40.0f;
         }
         if (IsKeyPressed(KEY_HOME)) g_form_scroll = 0;
@@ -2201,6 +2203,7 @@ static void draw_ui() {
     }
     EndScissorMode();
 
+    if (modal_open) GuiUnlock();
     draw_file_browser(g_app.browser);
 
     // --- Directory-URL picker ---
