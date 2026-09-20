@@ -184,6 +184,38 @@ partition is additionally reachable via a stable `/mnt/usb` symlink
 carry a single partition. The file browser picks these up
 automatically.
 
+## Naming what is on a partition
+
+Choosing which rootfs partition to overwrite used to mean choosing
+between lines like `UUID=705ad789-…  [part]  48.8 GiB  ext4` — two
+equally sized rootfs partitions are indistinguishable that way, and a
+filesystem label does not help either when every image of a project
+shares the same one. The partition list and the confirmation dialog
+therefore lead with the image itself:
+
+```
+kwin-image   (nvme0n1p2, 18.4 GiB ext4, SAMSUNG MZ1L23T8HBLA-00A07)
+```
+
+That name comes from `IMAGE_ID` in the partition's own
+`/etc/os-release`, read during the read-only probe that identifies a
+rootfs anyway — no extra mount. It is a standard os-release field
+(`os-release(5)`) that nothing in oe-core fills in; an image has to set
+it itself, for example from a `ROOTFS_POSTPROCESS_COMMAND` with
+`IMAGE_ID ?= "${IMAGE_BASENAME}"`. `IMAGE_VERSION` is shown next to it
+when present (a 14-digit bitbake `DATETIME` is rendered as a date), but
+a build timestamp in the rootfs defeats reproducible builds, so the
+images this layer is used with leave it out.
+
+Without it nothing breaks — the line falls back to `PRETTY_NAME`,
+then to the filesystem label — but two images of the same project stay
+as hard to tell apart as before. After writing a rootfs, the installer
+also renames the filesystem (`e2label`, or `btrfs filesystem label`) to
+the `IMAGE_ID` minus its `-image` suffix, so `lsblk` and a file manager
+show the same thing later on. UUIDs have not gone anywhere: they are
+still what the installer mounts and writes to, and they are still in
+the log.
+
 ## Scripts
 
 Helper tools under `scripts/`, not part of either image at runtime -

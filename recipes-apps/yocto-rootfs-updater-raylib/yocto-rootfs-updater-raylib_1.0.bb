@@ -32,6 +32,7 @@ RDEPENDS:${PN} = "\
     coreutils \
     liberation-fonts \
     btrfs-tools \
+    e2fsprogs-tune2fs \
 "
 
 inherit cmake systemd pkgconfig

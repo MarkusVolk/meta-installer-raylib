@@ -217,8 +217,14 @@ inline void run_checked(const std::vector<std::string>& args, const LogFn& log) 
     }
 }
 
+// Binary units, and labeled as such: this divided by 1024 but wrote
+// "GB"/"TB", so a 16 TB disk showed up as "14.6TB" - a number that
+// matches neither the label on the drive nor any other tool, in a
+// dialog whose whole job is letting someone recognize the right disk.
+// 1024 is the right divisor to keep (it is what lsblk, df -h and the
+// partitioning tools show); only the names were wrong.
 inline std::string human_size(double n) {
-    const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+    const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
     int u = 0;
     while (n >= 1024.0 && u < 4) { n /= 1024.0; ++u; }
     char buf[64];
@@ -270,7 +276,23 @@ inline bool is_mounted_at(const std::string& mountpoint) {
 // ---------------------------------------------------------------------
 
 struct PartitionInfo {
-    std::string name, path, size, type, fstype, mountpoint, label, uuid, pkname;
+    std::string name, path, size, type, fstype, mountpoint, label, uuid, pkname, model;
+};
+
+// What a partition actually holds, as read from its own /etc/os-release
+// during the read-only probe below. Every image built here shares one
+// DISTRO, so NAME/VERSION/PRETTY_NAME are identical across all of them;
+// the image-specific part is IMAGE_ID, which meta-image writes per
+// image (see its recipes-core/images/image.inc). IMAGE_VERSION is
+// picked up too when an image sets it, but meta-image deliberately
+// does not: a build timestamp in the rootfs would break reproducible
+// builds. image_id is empty for anything built before that existed,
+// or built elsewhere.
+struct RootfsIdent {
+    bool is_oe_rootfs = false;
+    std::string image_id;      // e.g. "kwin-image"
+    std::string image_version; // e.g. "20260920114214"
+    std::string pretty_name;   // e.g. "OpenEmbedded (wayland) kwin-image"
 };
 
 // Finds which physical disk (PKNAME) a given file path actually lives
@@ -322,7 +344,7 @@ inline std::vector<std::pair<std::string, std::string>> parse_kv_pairs(const std
 
 inline std::vector<PartitionInfo> list_partitions(const LogFn& log) {
     ProcResult r = exec_capture({"lsblk", "-P", "-b", "-o",
-                                  "NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID,PKNAME"});
+                                  "NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID,PKNAME,MODEL"});
     if (r.exit_code != 0) {
         log("lsblk error: " + r.output);
         return {};
@@ -345,23 +367,113 @@ inline std::vector<PartitionInfo> list_partitions(const LogFn& log) {
             else if (kv.first == "LABEL") p.label = kv.second;
             else if (kv.first == "UUID") p.uuid = kv.second;
             else if (kv.first == "PKNAME") p.pkname = kv.second;
+            // lsblk pads MODEL out of the raw SCSI/NVMe identify data,
+            // so it arrives with a long run of trailing spaces
+            // ("SAMSUNG MZ1L23T8HBLA-00A07              ") - confirmed
+            // on this project's own build machine.
+            else if (kv.first == "MODEL") {
+                std::string m = kv.second;
+                size_t b = m.find_first_not_of(" \t");
+                size_t e = m.find_last_not_of(" \t");
+                p.model = (b == std::string::npos) ? "" : m.substr(b, e - b + 1);
+            }
         }
         if (p.type == "part" || p.type == "disk") result.push_back(p);
+    }
+
+    // lsblk reports MODEL on the disk row only - a partition inherits
+    // nothing from its parent there. Copy it down, so a partition row
+    // can name the drive it sits on ("which of the two NVMes is this?")
+    // without every caller having to walk back to the parent itself.
+    std::map<std::string, std::string> model_by_disk;
+    for (auto& p : result) {
+        if (p.type == "disk" && !p.model.empty()) model_by_disk[p.name] = p.model;
+    }
+    for (auto& p : result) {
+        if (p.model.empty() && !p.pkname.empty()) {
+            auto it = model_by_disk.find(p.pkname);
+            if (it != model_by_disk.end()) p.model = it->second;
+        }
     }
     return result;
 }
 
-inline std::string partition_label(const PartitionInfo& p) {
-    std::string ident = p.uuid.empty() ? (p.path.empty() ? p.name : p.path) : ("UUID=" + p.uuid);
+// "20260920114214" (bitbake's DATETIME, should an image put that in
+// IMAGE_VERSION) -> "2026-09-20 11:42". Anything that isn't that exact
+// shape is passed through untouched rather than mangled - the field is
+// free-form in os-release, this is only the one shape worth prettifying.
+inline std::string format_build_time(const std::string& image_version) {
+    if (image_version.size() != 14) return image_version;
+    for (char c : image_version) if (!isdigit((unsigned char)c)) return image_version;
+    return image_version.substr(0, 4) + "-" + image_version.substr(4, 2) + "-" +
+           image_version.substr(6, 2) + " " + image_version.substr(8, 2) + ":" +
+           image_version.substr(10, 2);
+}
+
+// The parenthesized half of a partition line: where the partition is,
+// how big it is, and which drive it sits on. Split out so a caller
+// that writes its own first half (a boot partition names the
+// installation it belongs to) doesn't have to rebuild this part.
+inline std::string partition_detail(const PartitionInfo& p) {
     double bytes = 0;
     try { bytes = std::stod(p.size); } catch (...) {}
-    std::string s = ident + "  [" + p.type + "]  " + human_size(bytes);
-    if (!p.fstype.empty()) s += "  " + p.fstype;
-    if (!p.label.empty()) s += "  " + p.label;
-    if (!p.mountpoint.empty()) s += "  (mounted: " + p.mountpoint + ")";
+    std::string detail = (p.name.empty() ? p.path : p.name) + ", " + human_size(bytes);
+    if (!p.fstype.empty()) detail += " " + p.fstype;
+    if (!p.model.empty()) detail += ", " + p.model;
+    if (!p.mountpoint.empty()) detail += ", mounted at " + p.mountpoint;
+    return "(" + detail + ")";
+}
+
+// The one line a human reads before overwriting a partition, so it
+// leads with what is actually on it rather than with an identifier:
+//
+//   kwin-image   (nvme0n1p2, 18.4GiB ext4, SAMSUNG MZ1L23T8HBLA-00A07)
+//
+// This used to be "UUID=<36 hex characters>  [part]  18.4GB  ext4",
+// which two equally sized rootfs partitions share in every readable
+// respect - real-world report: an install was not attempted at all
+// because there was no way to tell which of them was the target. The
+// UUID is still what the install itself uses internally (see
+// partition_device_id) and still goes to the log; it just isn't what
+// the choice is made on.
+inline std::string partition_display(const PartitionInfo& p, const RootfsIdent& ident) {
+    std::string head;
+    if (!ident.image_id.empty()) {
+        head = ident.image_id;
+        std::string when = format_build_time(ident.image_version);
+        if (!when.empty()) head += " " + when;
+    } else if (!ident.pretty_name.empty()) {
+        // An OpenEmbedded rootfs predating IMAGE_ID, or one built
+        // elsewhere: its distro name is still better than nothing.
+        // Every image here shares that name, so the filesystem label
+        // goes with it - between two such installs it may be the only
+        // difference left.
+        head = ident.pretty_name;
+        if (!p.label.empty()) head += ", label: " + p.label;
+    } else if (!p.label.empty()) {
+        head = "(no image detected, label: " + p.label + ")";
+    } else {
+        head = "(unknown contents)";
+    }
+    return head + "   " + partition_detail(p);
+}
+
+// Same line for a whole disk (the wic install target). There is no
+// rootfs to identify - the disk is about to lose its partition table
+// and everything on it - so the drive's own model is the only thing
+// that tells two of them apart. Callers append the images found on it.
+inline std::string disk_display(const PartitionInfo& p) {
+    double bytes = 0;
+    try { bytes = std::stod(p.size); } catch (...) {}
+    std::string s = (p.name.empty() ? p.path : p.name) + "   (" + human_size(bytes);
+    if (!p.model.empty()) s += ", " + p.model;
+    s += ")";
     return s;
 }
 
+// What the install itself works with, unchanged: a UUID survives the
+// device renaming that plugging in another disk causes, a /dev/sdaN
+// does not. Only the display above stopped leading with it.
 inline std::string partition_device_id(const PartitionInfo& p) {
     if (!p.uuid.empty()) return "UUID=" + p.uuid;
     return p.path.empty() ? p.name : p.path;
@@ -1059,7 +1171,7 @@ inline void write_disk_image(const std::string& source, bool is_url, const std::
     run_checked({"sync"}, log);
 }
 
-// Only for marker checks in probe_is_rootfs: checks whether a path
+// Only for marker checks in probe_rootfs: checks whether a path
 // entry exists (even as a symlink) without resolving it. Needed
 // because e.g. /etc/os-release is often a symlink to
 // /usr/lib/os-release - stat() would resolve it against our OWN root,
@@ -1082,11 +1194,67 @@ inline bool file_contains_ci(const std::string& path, const std::string& needle_
     return content.find(needle_lower) != std::string::npos;
 }
 
+// Where a probed rootfs's os-release really is, WITHOUT ever leaving
+// that rootfs. Opening root + "/etc/os-release" directly would follow
+// the symlink as the kernel sees it: fine for a relative link
+// ("../usr/lib/os-release", what oe-core creates with "ln -rs"), but an
+// ABSOLUTE link ("/usr/lib/os-release", which some distros ship) would
+// resolve against the installer's OWN root - and every such partition
+// would then be reported as whatever this installer itself is. So the
+// link is read by hand and re-rooted.
+inline std::string os_release_path(const std::string& root) {
+    std::string link = root + "/etc/os-release";
+    char buf[4096];
+    ssize_t n = readlink(link.c_str(), buf, sizeof(buf) - 1);
+    if (n > 0) {
+        std::string target(buf, (size_t)n);
+        return target[0] == '/' ? root + target : root + "/etc/" + target;
+    }
+    return link; // a regular file, or absent (the caller's open fails then)
+}
+
+// Reads a rootfs's own os-release into KEY -> value. Deliberately not
+// read_simple_toml(): that one strips everything after a '#' as a
+// comment, which would cut a PRETTY_NAME short at the first '#' it
+// happens to contain - free text there is allowed to have one.
+// /etc/os-release is tried first (see os_release_path), the real file
+// under /usr/lib is the fallback for a rootfs whose link is missing.
+inline std::map<std::string, std::string> read_os_release(const std::string& root) {
+    std::map<std::string, std::string> out;
+    for (const std::string& path : {os_release_path(root), root + "/usr/lib/os-release"}) {
+        std::ifstream f(path);
+        if (!f) continue;
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || line[0] == '#') continue;
+            size_t eq = line.find('=');
+            if (eq == std::string::npos || eq == 0) continue;
+            std::string key = line.substr(0, eq);
+            std::string val = line.substr(eq + 1);
+            if (val.size() >= 2 && ((val.front() == '"' && val.back() == '"') ||
+                                    (val.front() == '\'' && val.back() == '\''))) {
+                val = val.substr(1, val.size() - 2);
+            }
+            out[key] = val;
+        }
+        if (!out.empty()) break;
+    }
+    return out;
+}
+
 // Reliable rootfs detection: mount read-only and look for rootfs
 // markers, rather than trusting filesystem type or label alone (those
 // can't distinguish /home from an actual rootfs). On mount failure
-// (e.g. already in use), conservatively returns false.
-inline bool probe_is_rootfs(const std::string& device, const LogFn& log) {
+// (e.g. already in use), conservatively reports "not a rootfs".
+//
+// The same mount also reads out which image this is (IMAGE_ID,
+// written per image by meta-image) - that is the whole
+// point of returning a struct rather than a bool: the partition list
+// needs a name to show, and mounting every candidate a second time
+// just to read one file would double the slowest part of startup.
+inline RootfsIdent probe_rootfs(const std::string& device, const LogFn& log) {
+    RootfsIdent ident;
     const std::string mp = "/tmp/.partition-probe";
     mkdirs(mp);
     if (is_mounted_at(mp)) exec_capture({"umount", mp});
@@ -1094,7 +1262,7 @@ inline bool probe_is_rootfs(const std::string& device, const LogFn& log) {
     ProcResult r = exec_capture({"mount", "-o", "ro", device, mp});
     if (r.exit_code != 0) {
         log("  " + device + ": not mountable (skipped)");
-        return false;
+        return ident;
     }
 
     auto has_rootfs_markers = [&](const std::string& root) {
@@ -1111,10 +1279,24 @@ inline bool probe_is_rootfs(const std::string& device, const LogFn& log) {
     // reliably filters out other distros (Fedora, Ubuntu, ...).
     auto is_openembedded_rootfs = [&](const std::string& root) {
         if (!has_rootfs_markers(root)) return false;
-        return file_contains_ci(root + "/etc/os-release", "openembedded");
+        return file_contains_ci(os_release_path(root), "openembedded");
+    };
+
+    // Only called for a root that already matched, so the fields are
+    // read from a rootfs we are going to report anyway.
+    auto fill_ident = [&](const std::string& root) {
+        auto osr = read_os_release(root);
+        auto pick = [&](const char* key) {
+            auto it = osr.find(key);
+            return it == osr.end() ? std::string() : it->second;
+        };
+        ident.image_id = pick("IMAGE_ID");
+        ident.image_version = pick("IMAGE_VERSION");
+        ident.pretty_name = pick("PRETTY_NAME");
     };
 
     bool looks_like_rootfs = is_openembedded_rootfs(mp);
+    if (looks_like_rootfs) fill_ident(mp);
     if (!looks_like_rootfs && has_rootfs_markers(mp)) {
         log("  " + device + ": rootfs found, but not OpenEmbedded/Yocto (skipped)");
     }
@@ -1132,6 +1314,7 @@ inline bool probe_is_rootfs(const std::string& device, const LogFn& log) {
                     std::string subvolPath = line.substr(pathPos + 6);
                     if (is_openembedded_rootfs(mp + "/" + subvolPath)) {
                         log("  " + device + ": OpenEmbedded rootfs found in btrfs subvolume \"" + subvolPath + "\"");
+                        fill_ident(mp + "/" + subvolPath);
                         looks_like_rootfs = true;
                         break;
                     }
@@ -1141,7 +1324,52 @@ inline bool probe_is_rootfs(const std::string& device, const LogFn& log) {
     }
 
     exec_capture({"umount", mp});
-    return looks_like_rootfs;
+    ident.is_oe_rootfs = looks_like_rootfs;
+    return ident;
+}
+
+// "kwin-image" -> "kwin". Mirrors IMAGE_FS_LABEL in meta-image's
+// recipes-core/images/image.inc, so a partition written by this
+// installer ends up with the same label wic would have given it.
+inline std::string fs_label_for_image(const std::string& image_id) {
+    const std::string suffix = "-image";
+    if (image_id.size() > suffix.size() &&
+        image_id.compare(image_id.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        return image_id.substr(0, image_id.size() - suffix.size());
+    }
+    return image_id;
+}
+
+// Renames the filesystem on an already-written partition to match the
+// image now on it, so that lsblk, a file manager or the next run of
+// this installer show something other than the label the partition was
+// created with years ago (every image built here used to get the same
+// hardcoded one). Best effort by design: a failure here leaves a
+// perfectly working installation with a stale name, which is not worth
+// aborting an otherwise finished install over - it is logged instead.
+inline void set_fs_label(const std::string& device, const std::string& fstype,
+                          const std::string& label, const LogFn& log) {
+    if (label.empty() || device.empty()) return;
+    std::vector<std::string> cmd;
+    std::string applied = label;
+    if (fstype == "ext2" || fstype == "ext3" || fstype == "ext4") {
+        // An ext label is 16 bytes; e2label silently truncates, but
+        // then the label no longer matches what we logged.
+        if (applied.size() > 16) {
+            applied = applied.substr(0, 16);
+            log("Label \"" + label + "\" shortened to \"" + applied + "\" (ext limit is 16 characters).");
+        }
+        cmd = {"e2label", device, applied};
+    } else if (fstype == "btrfs") {
+        cmd = {"btrfs", "filesystem", "label", device, applied};
+    } else {
+        log("Not relabeling " + device + ": no tool wired up for " +
+            (fstype.empty() ? std::string("this filesystem") : fstype) + ".");
+        return;
+    }
+    ProcResult r = exec_capture(cmd);
+    if (r.exit_code == 0) log("Partition label set to \"" + applied + "\".");
+    else log("Could not set the partition label (" + strip_ansi_codes(r.output) + ") - continuing.");
 }
 
 // Boot partition matching now happens in main.cpp via PKNAME (same

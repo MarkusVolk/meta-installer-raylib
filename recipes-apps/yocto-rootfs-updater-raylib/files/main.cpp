@@ -19,7 +19,6 @@ extern "C" {
 #include <algorithm>
 #include <cmath>
 #include <map>
-#include <set>
 #include <deque>
 #include <dirent.h>
 #include <fcntl.h>
@@ -1063,7 +1062,7 @@ static bool label_looks_like_home(const std::string& label) {
     return lower.find("home") != std::string::npos;
 }
 
-// Per-device cache for backend::probe_is_rootfs() - a real report
+// Per-device cache for backend::probe_rootfs() - a real report
 // (console photo) showed every rootfs-like partition being mounted,
 // probed and unmounted TWICE during startup: once by rootfs_sel's own
 // refresh(), then again by boot_sel's refresh() to work out which
@@ -1074,17 +1073,23 @@ static bool label_looks_like_home(const std::string& label) {
 // pass now reuses the first pass's answers. Cleared by the explicit
 // Refresh button so a deliberate rescan still probes fresh (e.g.
 // after plugging in a disk).
-static std::map<std::string, bool> g_probe_cache;
-static bool cached_probe_is_rootfs(const std::string& dev) {
+static std::map<std::string, backend::RootfsIdent> g_probe_cache;
+static const backend::RootfsIdent& cached_probe_rootfs(const std::string& dev) {
     auto it = g_probe_cache.find(dev);
     if (it != g_probe_cache.end()) return it->second;
-    bool r = backend::probe_is_rootfs(dev, log_msg);
-    g_probe_cache[dev] = r;
-    return r;
+    return g_probe_cache[dev] = backend::probe_rootfs(dev, log_msg);
 }
 
 struct PartitionSelector {
     std::vector<backend::PartitionInfo> partitions;
+    // What is installed on partitions[i], as read during the probe.
+    // Parallel to "partitions" rather than a member of PartitionInfo:
+    // that struct mirrors one lsblk row, and lsblk knows nothing about
+    // the contents of a filesystem.
+    std::vector<backend::RootfsIdent> idents;
+    // DisksOnly only: disk name (as in lsblk's NAME, e.g. "nvme0n1")
+    // -> the images installed on it, comma separated.
+    std::map<std::string, std::string> disk_images;
     int selected_idx = 0;
     char mountpoint_buf[256] = "";
     PartitionFilter filter = PartitionFilter::Any;
@@ -1092,6 +1097,7 @@ struct PartitionSelector {
     void refresh() {
         auto all = backend::list_partitions(log_msg);
         partitions.clear();
+        idents.clear();
 
         // For DisksOnly, find which disk the live installer system
         // itself is running from (PKNAME of whatever partition is
@@ -1101,23 +1107,53 @@ struct PartitionSelector {
         // unguarded, found via real-world use (it showed up in the
         // disk list).
         std::string own_boot_disk;
+        // ...and, for the same list, which installations each disk
+        // carries. A wic install takes the whole drive, so naming what
+        // is about to be lost matters more here than anywhere else.
+        // The probe is the same one the rootfs list does and shares its
+        // cache, so whichever of the two selectors refreshes first pays
+        // for it and the other gets it for free - no extra mounts.
+        disk_images.clear();
         if (filter == PartitionFilter::DisksOnly) {
             for (auto& p : all) {
                 if (p.mountpoint == "/") { own_boot_disk = p.pkname; break; }
+            }
+            log_msg("Searching disks for installed images (briefly probing read-only)...");
+            for (auto& p : all) {
+                if (p.type != "part" || !p.mountpoint.empty()) continue;
+                if (!is_rootfs_like_fstype(p.fstype) || label_looks_like_home(p.label)) continue;
+                const backend::RootfsIdent& id = cached_probe_rootfs(p.path.empty() ? p.name : p.path);
+                if (!id.is_oe_rootfs || id.image_id.empty()) continue;
+                std::string& acc = disk_images[p.pkname];
+                if (!acc.empty()) acc += ", ";
+                acc += id.image_id;
             }
         }
 
         // For BootLike, first find which disks (PKNAME) actually carry
         // a verified OpenEmbedded rootfs; a boot partition matches if
         // it's on the same disk. More robust than searching boot
-        // loader entries for a specific kernel parameter.
-        std::set<std::string> oe_disk_pknames;
+        // loader entries for a specific kernel parameter. Keeping the
+        // rootfs identification (not just the fact that there was one)
+        // lets a boot partition be shown as the one belonging to that
+        // installation - a bare FAT partition has nothing of its own
+        // to distinguish it by.
+        std::map<std::string, backend::RootfsIdent> oe_disk_idents;
         if (filter == PartitionFilter::BootLike) {
             log_msg("Searching disks with OpenEmbedded rootfs (for boot partition matching)...");
             for (auto& p : all) {
                 if (p.type == "part" && is_rootfs_like_fstype(p.fstype) && !label_looks_like_home(p.label)) {
                     std::string dev = p.path.empty() ? p.name : p.path;
-                    if (cached_probe_is_rootfs(dev)) oe_disk_pknames.insert(p.pkname);
+                    const backend::RootfsIdent& id = cached_probe_rootfs(dev);
+                    if (!id.is_oe_rootfs) continue;
+                    // A disk carrying several installations shares
+                    // one ESP between them - name them all rather
+                    // than whichever lsblk listed first.
+                    auto ins = oe_disk_idents.emplace(p.pkname, id);
+                    if (!ins.second && !id.image_id.empty()) {
+                        std::string& acc = ins.first->second.image_id;
+                        acc += (acc.empty() ? "" : ", ") + id.image_id;
+                    }
                 }
             }
         }
@@ -1138,20 +1174,71 @@ struct PartitionSelector {
                            is_rootfs_like_fstype(p.fstype) && !label_looks_like_home(p.label);
                     if (keep) {
                         std::string dev = p.path.empty() ? p.name : p.path;
-                        keep = cached_probe_is_rootfs(dev);
+                        keep = cached_probe_rootfs(dev).is_oe_rootfs;
                     }
                     break;
                 }
                 case PartitionFilter::BootLike: {
                     keep = !currently_mounted && (p.type == "part") && is_boot_like_fstype(p.fstype) &&
-                           oe_disk_pknames.count(p.pkname) > 0;
+                           oe_disk_idents.count(p.pkname) > 0;
                     break;
                 }
                 default:                           keep = true; break;
             }
-            if (keep) partitions.push_back(p);
+            if (!keep) continue;
+
+            // Whatever is known about this row's contents: the rootfs
+            // itself for a rootfs row, and for a boot partition the
+            // rootfs sharing its disk (that is the installation it
+            // boots). A disk row stays empty - it is about to lose
+            // everything on it anyway, and disk_display() names the
+            // drive instead.
+            backend::RootfsIdent ident;
+            if (filter == PartitionFilter::RootfsLike) {
+                ident = cached_probe_rootfs(p.path.empty() ? p.name : p.path);
+            } else if (filter == PartitionFilter::BootLike) {
+                auto it = oe_disk_idents.find(p.pkname);
+                if (it != oe_disk_idents.end()) ident = it->second;
+            }
+            partitions.push_back(p);
+            idents.push_back(ident);
         }
         selected_idx = partitions.empty() ? -1 : 0;
+    }
+
+    // The line shown for row i, in the dropdown and (via
+    // selected_display()) in the confirmation dialog.
+    std::string display(size_t i) const {
+        if (i >= partitions.size()) return "";
+        const backend::PartitionInfo& p = partitions[i];
+        if (filter == PartitionFilter::DisksOnly) {
+            std::string s = backend::disk_display(p);
+            auto it = disk_images.find(p.name);
+            if (it != disk_images.end() && !it->second.empty()) s += "   holds: " + it->second;
+            return s;
+        }
+        const backend::RootfsIdent& id = idents[i];
+        if (filter == PartitionFilter::BootLike) {
+            // The FAT partition itself carries no image, so it is named
+            // after the installation it boots (the rootfs on its disk).
+            std::string owner = id.image_id.empty() ? std::string("an OpenEmbedded install")
+                                                    : id.image_id;
+            return "boot partition of " + owner + "   " + backend::partition_detail(p);
+        }
+        return backend::partition_display(p, id);
+    }
+
+    std::string selected_display() const {
+        if (selected_idx < 0 || selected_idx >= (int)partitions.size()) return "";
+        return display((size_t)selected_idx);
+    }
+
+    // The selected row itself, for the things get_device()'s "UUID=..."
+    // cannot be used for - e2label wants a device node, and the
+    // filesystem type decides which tool does the renaming at all.
+    const backend::PartitionInfo* selected_partition() const {
+        if (selected_idx < 0 || selected_idx >= (int)partitions.size()) return nullptr;
+        return &partitions[(size_t)selected_idx];
     }
 
     std::string get_device() const {
@@ -1169,6 +1256,31 @@ struct PartitionSelector {
     std::string get_mountpoint() const { return mountpoint_buf; }
 };
 
+// raygui draws combo box text without clipping it to the widget, so an
+// over-long entry simply runs out past the border instead of being cut
+// off. The lines here start with the part that matters (which image is
+// on the partition) and end with the drive model, so shortening from
+// the right drops the least important part first. Binary search rather
+// than shaving off one character at a time: this runs every frame, for
+// every row, and text measuring against the loaded TTF is the
+// expensive part.
+static std::string elide_to_width(const std::string& s, float max_w) {
+    const float fs = (float)GuiGetStyle(DEFAULT, TEXT_SIZE);
+    auto width = [&](const std::string& t) {
+        return MeasureTextEx(GuiGetFont(), t.c_str(), fs, 1.0f).x;
+    };
+    if (max_w <= 0 || width(s) <= max_w) return s;
+    size_t lo = 0, hi = s.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        if (width(s.substr(0, mid) + "...") <= max_w) lo = mid; else hi = mid - 1;
+    }
+    // Never cut inside a multi-byte UTF-8 sequence (a mountpoint or a
+    // label can carry one): back up to the start of the character.
+    while (lo > 0 && ((unsigned char)s[lo] & 0xC0) == 0x80) --lo;
+    return s.substr(0, lo) + "...";
+}
+
 static float draw_partition_selector(const char* title, PartitionSelector& sel, float x, float y,
                                       float w, int field_id_base, bool enabled,
                                       bool show_mountpoint = true) {
@@ -1179,8 +1291,24 @@ static float draw_partition_selector(const char* title, PartitionSelector& sel, 
     GuiLabel({x, y, w, ROW}, title);
     y += ROW + GAP;
 
+    const float COMBO_W = w - BTNW - 10 * g_ui_scale;
+    // What the combo box actually leaves for text: its own drop-down
+    // button on the right, plus the padding raygui puts around the
+    // label on both sides.
+    const float COMBO_TEXT_W = COMBO_W - (float)(GuiGetStyle(COMBOBOX, COMBO_BUTTON_WIDTH) +
+                                                 GuiGetStyle(COMBOBOX, COMBO_BUTTON_SPACING)) -
+                               4.0f * (float)GuiGetStyle(DEFAULT, TEXT_PADDING) - 8.0f;
+
     std::string combo_text;
-    for (auto& p : sel.partitions) { combo_text += backend::partition_label(p); combo_text += ";"; }
+    for (size_t i = 0; i < sel.partitions.size(); ++i) {
+        std::string row = elide_to_width(sel.display(i), COMBO_TEXT_W);
+        // ';' is raygui's entry separator - a label or drive model
+        // containing one would split the row into two bogus entries
+        // and shift every selection after it.
+        std::replace(row.begin(), row.end(), ';', ',');
+        combo_text += row;
+        combo_text += ";";
+    }
     if (!combo_text.empty()) combo_text.pop_back();
     if (combo_text.empty()) {
         switch (sel.filter) {
@@ -1191,7 +1319,7 @@ static float draw_partition_selector(const char* title, PartitionSelector& sel, 
         }
     }
     int active = sel.selected_idx < 0 ? 0 : sel.selected_idx;
-    GuiComboBox({x, y, w - BTNW - 10 * g_ui_scale, ROW}, combo_text.c_str(), &active);
+    GuiComboBox({x, y, COMBO_W, ROW}, combo_text.c_str(), &active);
     if (!sel.partitions.empty()) sel.selected_idx = active;
     if (focusable_button(field_id_base + 2, {x + w - BTNW, y, BTNW, ROW}, "Refresh")) { g_probe_cache.clear(); sel.refresh(); }
     y += ROW + GAP;
@@ -1413,6 +1541,10 @@ static void run_pipeline(AppState snapshot) {
         std::string kernel_device = do_kernel ? snapshot.boot_sel.get_device() : "";
         std::string kernel_mp = do_kernel ? snapshot.boot_sel.get_mountpoint() : "";
 
+        // Both spellings in the log: the readable one for whoever
+        // reads the log afterwards, the UUID for what was actually
+        // written to.
+        log_msg("Target: " + snapshot.rootfs_sel.selected_display());
         log_msg("Mounting rootfs partition " + rootfs_device + " at " + rootfs_mp + "...");
         set_progress(0, 1, "Mounting rootfs partition...");
         backend::do_mount(rootfs_device, rootfs_mp, log_msg);
@@ -1453,6 +1585,18 @@ static void run_pipeline(AppState snapshot) {
 
         backend::restore_nested_excludes(rootfs_mp, nested_backups, log_msg);
 
+        // Which image this actually turned out to be, read back from
+        // what was just written rather than guessed from the file name
+        // of the tarball. Used further down to rename the filesystem,
+        // once it is unmounted again.
+        std::string installed_image_id;
+        {
+            auto osr = backend::read_os_release(rootfs_mp);
+            auto it = osr.find("IMAGE_ID");
+            if (it != osr.end()) installed_image_id = it->second;
+        }
+        if (!installed_image_id.empty()) log_msg("Installed image: " + installed_image_id);
+
         if (do_kernel) {
             std::string target_name = snapshot.kernel_target_name[0] ? snapshot.kernel_target_name : "bzImage";
             std::string dest = kernel_mp + "/" + target_name;
@@ -1479,6 +1623,23 @@ static void run_pipeline(AppState snapshot) {
         // sequence instead.
         if (do_kernel) { log_msg("Unmounting " + kernel_mp + "..."); backend::do_unmount(kernel_mp, log_msg); }
         log_msg("Unmounting " + rootfs_mp + "..."); backend::do_unmount(rootfs_mp, log_msg);
+
+        // Name the partition after what is now on it, so the next run
+        // of this installer - and lsblk, and a file manager - can tell
+        // it apart from the other rootfs partitions. Deliberately
+        // after the unmount: e2label writes the superblock directly,
+        // and on a mounted filesystem the kernel's own cached copy
+        // would be written back over it at unmount time.
+        {
+            const backend::PartitionInfo* target = snapshot.rootfs_sel.selected_partition();
+            std::string devnode = target ? (target->path.empty() ? target->name : target->path) : "";
+            if (installed_image_id.empty()) {
+                log_msg("Installed image declares no IMAGE_ID - leaving the partition label as it was.");
+            } else if (!devnode.empty()) {
+                backend::set_fs_label(devnode, target->fstype,
+                                       backend::fs_label_for_image(installed_image_id), log_msg);
+            }
+        }
 
         set_progress(1, 1, "Done. Rebooting shortly...");
         finish(false, "");
@@ -2689,25 +2850,37 @@ static void draw_ui() {
         g_field_order.clear();
         DrawRectangle(0, 0, (int)sw, (int)sh, Fade(BLACK, 0.5f));
         std::string msg;
+        // The target is spelled out the way the dropdown shows it -
+        // which image is on it, which device, which drive - and not as
+        // the bare "UUID=<36 hex characters>" this dialog used to
+        // print. That string is what the install works with
+        // internally, but it is not something anyone can check a
+        // decision against, and this dialog is the last point at which
+        // the decision can still be corrected.
         if (g_app.install_mode == 0) {
-            std::string dev = g_app.rootfs_sel.get_device();
             std::string mp = g_app.rootfs_sel.get_mountpoint();
+            std::string target = g_app.rootfs_sel.selected_display();
             std::string rootfs_src = current_source_display(g_app.rootfs_source_kind, g_app.rootfs_local_path, g_app.rootfs_http_url, g_app.rootfs_url);
             msg = "Source: " + rootfs_src + "\n\n"
-                  "WARNING: All data on " + dev + " (" + mp + ") will be erased!\n"
+                  "Target: " + target + "\n"
+                  "Mounted at " + mp + " during the install.\n\n"
+                  "WARNING: All data on this partition will be erased!\n"
                   "Foreign mountpoints inside it (e.g. /home) are skipped automatically.";
             if (g_app.kernel_enabled) {
                 std::string kernel_src = current_source_display(g_app.kernel_source_kind, g_app.kernel_local_path, g_app.kernel_http_url, g_app.kernel_url);
-                msg += "\nThe kernel on " + g_app.boot_sel.get_device() + " will also be updated, from: " + kernel_src;
+                msg += "\n\nThe kernel will also be updated, on:\n" +
+                       g_app.boot_sel.selected_display() + "\nfrom: " + kernel_src;
             }
         } else {
             std::string dev = g_app.disk_sel.get_device();
+            std::string target = g_app.disk_sel.selected_display();
             std::string wic_src = current_source_display(g_app.wic_source_kind, g_app.wic_local_path, g_app.wic_http_url, g_app.wic_url);
             msg = "Source: " + wic_src + "\n\n"
-                  "WARNING: " + dev + " WILL BE COMPLETELY OVERWRITTEN!\n"
-                  "The entire disk, including its partition table, will be lost -\n"
-                  "including /home and any other partitions on it.\n"
-                  "This is not an update, but a fresh installation.";
+                  "Target: " + target + "\n";
+            msg += "\nWARNING: " + dev + " WILL BE COMPLETELY OVERWRITTEN!\n"
+                   "The entire disk, including its partition table, will be lost -\n"
+                   "including /home and any other partitions on it.\n"
+                   "This is not an update, but a fresh installation.";
         }
         int btn_active = -1;
         // Box height sized to the actual wrapped message content, not
