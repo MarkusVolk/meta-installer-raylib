@@ -1278,6 +1278,19 @@ static std::vector<std::string> discover_local_file_candidate_dirs() {
             // duplicate candidate.
             if (name == "usb") continue;
             if (name.rfind("usb", 0) == 0) dirs.push_back("/mnt/" + name);
+            // /mnt/storage itself, plus the numbered /mnt/storage2,
+            // /mnt/storage3 ... that initramfs-home-mount adds for a
+            // "home"-labeled partition on any FURTHER disk - on a
+            // machine carrying two complete build systems on separate
+            // disks, the image to install is just as likely to be the
+            // newest one on the disk that wasn't booted from. Skipped
+            // when it already is the browser's start directory (the
+            // list's first entry above), which would only produce a
+            // duplicate candidate.
+            if (name.rfind("storage", 0) == 0) {
+                std::string path = "/mnt/" + name;
+                if (path != g_cfg_filebrowser_start_dir) dirs.push_back(path);
+            }
         }
         closedir(mnt);
     }
@@ -3202,6 +3215,14 @@ int main(void) {
     // of "/" - no config.toml edit needed for the common case. An
     // explicit filebrowser_start_dir in config.toml still wins.
     std::string browser_dir_fallback = backend::is_mountpoint("/mnt/storage") ? "/mnt/storage" : "/";
+    // With a second storage mount present - initramfs-home-mount
+    // found a "home"-labeled partition on another disk as well and
+    // put it at /mnt/storage2 - start one level up instead, where
+    // /mnt lists both of them (and the usb-<dev> mounts) side by
+    // side: with more than one of them, which one to take IS the
+    // choice to make, and starting inside just one would hide the
+    // other behind an upward navigation there is no reason to expect.
+    if (backend::is_mountpoint("/mnt/storage2")) browser_dir_fallback = "/mnt";
     g_cfg_filebrowser_start_dir = cfg_get("filebrowser_start_dir", browser_dir_fallback);
     std::string cfg_kernel_target = cfg_get("kernel_target_name", "bzImage");
     // Unlike rootfs_mountpoint/boot_mountpoint (internal, temporary
@@ -3271,8 +3292,8 @@ int main(void) {
         log_msg("http_default_dir configured: " + cfg_http_default_dir);
     }
     log_msg("Configuration loaded (" + std::to_string(cfg.size()) + " values from config.toml).");
-    if (browser_dir_fallback == "/mnt/storage" && !cfg.count("filebrowser_start_dir")) {
-        log_msg("Storage partition detected at /mnt/storage, file browser will start there.");
+    if (browser_dir_fallback != "/" && !cfg.count("filebrowser_start_dir")) {
+        log_msg("Storage partition detected, file browser will start in " + browser_dir_fallback + ".");
     }
 
     // Auto-pick the most recently modified matching file already

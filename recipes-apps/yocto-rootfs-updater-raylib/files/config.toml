@@ -18,8 +18,10 @@ boot_mountpoint = "/mnt/boot"
 #kernel_sha256_default = ""
 
 # If storage-partition-helper already mounted its partition at
-# /mnt/storage, the file browser starts there automatically. Uncomment
-# to force a specific directory instead.
+# /mnt/storage, the file browser starts there automatically - or in
+# /mnt when initramfs-home-mount found a "home" partition on a second
+# disk too and mounted it at /mnt/storage2 as well. Uncomment to force
+# a specific directory instead.
 #filebrowser_start_dir = "/"
 
 # Extra local-file auto-pick candidate directory ("/mnt/storage/<value>"
