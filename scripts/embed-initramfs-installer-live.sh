@@ -111,8 +111,8 @@ EOF
 
 echo "Wrote initramfs installer boot entry (sort-key 9-installer)."
 
-# Unlike add-initramfs-installer-boot-entry.sh (which renames the
-# desktop's own entry to "Desktop" for consistent ordering), this
+# Unlike add-initramfs-installer-boot-entry.sh (which gives the
+# desktop's own entry a sort-key for consistent ordering), this
 # system's own existing entries are deliberately left untouched -
 # rewriting someone else's already-working boot configuration carries
 # more risk than it's worth. Check the resulting boot menu order and

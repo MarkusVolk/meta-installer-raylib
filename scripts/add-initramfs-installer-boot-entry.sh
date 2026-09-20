@@ -167,10 +167,13 @@ setsid mcopy -D o -i "$DESKTOP_ESP_PART" /tmp/.initramfs-entry.conf.$$ ::/loader
 rm -f /tmp/.initramfs-entry.conf.$$
 echo "Wrote initramfs installer boot entry (sort-key 9-installer, sorts after the desktop's own entry)."
 
-# --- Rename the desktop's own default entry to "Desktop" and give it
-# a sort-key too: systemd-boot sorts entries WITH a sort-key before
-# those WITHOUT one, regardless of value - giving only the new entry
-# one would make ordering WORSE, not better. ---
+# --- Give the desktop's own default entry a sort-key too: systemd-boot
+# sorts entries WITH a sort-key before those WITHOUT one, regardless of
+# value - giving only the new entry one would make ordering WORSE, not
+# better. The title is left as the image wrote it: meta-image's wks
+# passes IMAGE_ID (kwin-image, plasma-image, ...) to wic, and that name
+# is what the menu should show. Only wic's bare default "boot", as
+# written by images built before that, is replaced by "Desktop". ---
 DESKTOP_DEFAULT_ENTRY=$(setsid mcopy -i "$DESKTOP_ESP_PART" ::/loader/loader.conf - < /dev/null 2>/dev/null | \
     grep '^default ' | awk '{print $2}' || true)
 case "$DESKTOP_DEFAULT_ENTRY" in
@@ -182,11 +185,15 @@ esac
 if [ -n "$DESKTOP_DEFAULT_ENTRY" ]; then
     setsid mcopy -i "$DESKTOP_ESP_PART" "::/loader/entries/${DESKTOP_DEFAULT_ENTRY}.conf" /tmp/.desktop-entry.$$ < /dev/null 2>/dev/null || true
     if [ -f /tmp/.desktop-entry.$$ ]; then
+        DESKTOP_TITLE=$(sed -n 's/^title[[:space:]]\{1,\}//p' /tmp/.desktop-entry.$$ | head -n 1)
+        case "$DESKTOP_TITLE" in
+            ""|boot) DESKTOP_TITLE="Desktop" ;;
+        esac
         sed -i '/^title /d; /^sort-key /d' /tmp/.desktop-entry.$$
-        { echo "title Desktop"; cat /tmp/.desktop-entry.$$; echo "sort-key 0-desktop"; } > /tmp/.desktop-entry-new.$$
+        { echo "title ${DESKTOP_TITLE}"; cat /tmp/.desktop-entry.$$; echo "sort-key 0-desktop"; } > /tmp/.desktop-entry-new.$$
         setsid mcopy -D o -i "$DESKTOP_ESP_PART" /tmp/.desktop-entry-new.$$ "::/loader/entries/${DESKTOP_DEFAULT_ENTRY}.conf" < /dev/null
         rm -f /tmp/.desktop-entry.$$ /tmp/.desktop-entry-new.$$
-        echo "Desktop's own boot entry renamed to 'Desktop', sort-key added so it shows before the installer entry."
+        echo "Desktop's own boot entry titled '${DESKTOP_TITLE}', sort-key added so it shows before the installer entry."
     fi
 else
     echo "W: Could not determine the desktop's own default boot entry - leaving its title/sort-key untouched."
