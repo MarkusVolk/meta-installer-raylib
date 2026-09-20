@@ -1,9 +1,13 @@
-SUMMARY = "Mounts a home-labeled partition on the boot disk at /mnt/storage (initramfs image only)"
+SUMMARY = "Mounts the home-labeled partitions at /mnt/storage[N] (initramfs image only)"
 DESCRIPTION = "The initramfs image's own, much smaller replacement for \
-storage-partition-helper - only finds and mounts an ALREADY-existing \
-\"home\"-labeled partition on the same disk this system itself booted \
-from, no partition creation/growing logic at all (that part was \
-explicitly dropped as unnecessary here). Determines the boot disk via \
+storage-partition-helper - only finds and mounts ALREADY-existing \
+\"home\"-labeled partitions, no partition creation/growing logic at all \
+(that part was explicitly dropped as unnecessary here). The one on the \
+disk this system itself booted from is mounted read-only at \
+/mnt/storage, any further one at /mnt/storage2, /mnt/storage3 ... so a \
+machine with more than one complete build system on separate disks can \
+install an image built on either of them. Skipped for the other disks \
+when booted from removable media. Determines the boot disk via \
 systemd-boot's own LoaderDevicePartUUID EFI variable, not the root \
 filesystem's own backing device (meaningless here - this image's own \
 root is a tmpfs, with no real block device backing it at all)."

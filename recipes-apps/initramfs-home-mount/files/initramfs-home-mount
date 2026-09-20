@@ -1,10 +1,29 @@
 #!/bin/sh
-# Mounts a "home"-labeled partition, found on the SAME disk this
-# system itself booted from, at /mnt/storage - the initramfs image's
-# own, much smaller replacement for storage-partition-helper (which
-# additionally creates/grows a dedicated partition - unneeded and
-# explicitly dropped here, this only finds and mounts an ALREADY-
-# existing one).
+# Mounts every "home"-labeled partition found in this machine at
+# /mnt/storage, /mnt/storage2, /mnt/storage3 ... - the initramfs
+# image's own, much smaller replacement for storage-partition-helper
+# (which additionally creates/grows a dedicated partition - unneeded
+# and explicitly dropped here, this only finds and mounts ALREADY-
+# existing ones).
+#
+# The one on the disk this system booted from always comes first and
+# keeps the plain /mnt/storage name, so the app's own defaults built
+# around that single path (file browser start directory, download
+# staging directory, local_default_dir) behave exactly as before; any
+# further disk only ever ADDS a numbered mount point next to it. That
+# matters on a machine with more than one complete build system on
+# separate disks: the installer is booted from one disk's ESP, but the
+# image to install was just built on the other one, and restricting
+# the search to the boot disk made those files unreachable - the
+# reason this was widened from one partition to all of them.
+#
+# Not applied when booted from removable media: a standalone installer
+# stick has no business mounting a machine's internal data partitions
+# just for being plugged in, and its own "boot disk" is the stick
+# itself. Transport bus via lsblk's TRAN column ("usb"), not the
+# /sys/block/<disk>/removable flag - the latter reports 0 for the very
+# common case of a USB stick presenting itself as a fixed disk, while
+# TRAN reflects how the device is actually attached.
 #
 # "Same disk this system booted from" cannot be answered by looking at
 # the root filesystem's own backing device here (the usual approach,
@@ -95,24 +114,72 @@ if [ -z "$BOOT_DISK_NAME" ]; then
     exit 0
 fi
 
-# Search every partition on that SAME disk (not any other disk that
-# might also happen to have a "home"-labeled partition) for the one
-# actually labeled "home".
-HOME_DEV=""
-for CANDIDATE in "/dev/${BOOT_DISK_NAME}"*; do
+BOOT_DISK_TRAN=$(lsblk -dno TRAN "/dev/${BOOT_DISK_NAME}" 2>/dev/null || true)
+if [ "$BOOT_DISK_TRAN" = "usb" ]; then
+    SCAN_OTHER_DISKS="no"
+    echo "I: booted from USB (/dev/${BOOT_DISK_NAME}) - only that disk is searched, internal disks are left alone."
+else
+    SCAN_OTHER_DISKS="yes"
+fi
+
+# Every partition in the machine, one device node per line. "-r" makes
+# lsblk print raw, single-space-separated columns (no tree drawing
+# characters, no padding), so "${LINE%% *}" is an exact split; "-p"
+# gives full /dev paths. Partition device names never contain spaces,
+# so the newline-only IFS below is enough to iterate the result safely.
+list_partitions() {
+    PREV_IFS="$IFS"
+    IFS='
+'
+    for LINE in $(lsblk -nrpo NAME,TYPE 2>/dev/null); do
+        case "$LINE" in
+            *' part') echo "${LINE%% *}" ;;
+        esac
+    done
+    IFS="$PREV_IFS"
+}
+
+# Collected in two groups so the boot disk's own home partition keeps
+# the unnumbered /mnt/storage mount point regardless of the order
+# lsblk happens to report the disks in.
+BOOT_DISK_PARTS=""
+OTHER_DISK_PARTS=""
+for CANDIDATE in $(list_partitions); do
     [ -b "$CANDIDATE" ] || continue
     CANDIDATE_LABEL=$(blkid -o value -s LABEL "$CANDIDATE" 2>/dev/null || true)
-    if [ "$CANDIDATE_LABEL" = "$LABEL" ]; then
-        HOME_DEV="$CANDIDATE"
-        break
+    [ "$CANDIDATE_LABEL" = "$LABEL" ] || continue
+    CANDIDATE_DISK=$(lsblk -no PKNAME "$CANDIDATE" 2>/dev/null || true)
+    if [ "$CANDIDATE_DISK" = "$BOOT_DISK_NAME" ]; then
+        BOOT_DISK_PARTS="${BOOT_DISK_PARTS} ${CANDIDATE}"
+    elif [ "$SCAN_OTHER_DISKS" = "yes" ]; then
+        OTHER_DISK_PARTS="${OTHER_DISK_PARTS} ${CANDIDATE}"
     fi
 done
 
-if [ -z "$HOME_DEV" ]; then
-    echo "I: no partition labeled \"$LABEL\" found on boot disk (/dev/$BOOT_DISK_NAME) - nothing to mount."
-    exit 0
-fi
+# Read-only throughout: a rescue tool has no business writing to a
+# system's own data partition, and that applies to the other disks
+# found here at least as much as to the boot disk's own.
+MOUNTED=0
+for HOME_DEV in ${BOOT_DISK_PARTS} ${OTHER_DISK_PARTS}; do
+    MOUNTED=$((MOUNTED + 1))
+    if [ "$MOUNTED" -eq 1 ]; then
+        TARGET="$MOUNTPOINT"
+    else
+        TARGET="${MOUNTPOINT}${MOUNTED}"
+    fi
+    mkdir -p "$TARGET"
+    # Not fatal: one unreadable filesystem (damaged, or a type this
+    # minimal image has no kernel module for) must not cost the others
+    # their mount - the whole point of looking at several disks.
+    if mount -o ro "$HOME_DEV" "$TARGET"; then
+        echo "Mounted $HOME_DEV (label \"$LABEL\") at $TARGET."
+    else
+        echo "W: could not mount $HOME_DEV at $TARGET - skipping it."
+        rmdir "$TARGET" 2>/dev/null || true
+        MOUNTED=$((MOUNTED - 1))
+    fi
+done
 
-mkdir -p "$MOUNTPOINT"
-mount -o ro "$HOME_DEV" "$MOUNTPOINT"
-echo "Mounted $HOME_DEV (label \"$LABEL\", boot disk /dev/$BOOT_DISK_NAME) at $MOUNTPOINT."
+if [ "$MOUNTED" -eq 0 ]; then
+    echo "I: no partition labeled \"$LABEL\" found - nothing to mount."
+fi

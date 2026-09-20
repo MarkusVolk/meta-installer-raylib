@@ -1,10 +1,9 @@
 [Unit]
-Description=Mount home partition on the boot disk at /mnt/storage
-# Ensures all partitions on the boot disk have actually been
-# discovered/processed by udev before this searches for the "home"-
-# labeled one among them - the same kind of timing concern storage-
-# partition-helper's own service unit (on the disk-backed image) waits
-# on too.
+Description=Mount the home-labeled partitions at /mnt/storage[N]
+# Ensures every partition has actually been discovered/processed by
+# udev before this searches the "home"-labeled ones among them - the
+# same kind of timing concern storage-partition-helper's own service
+# unit (on the disk-backed image) waits on too.
 After=systemd-udev-settle.service
 Wants=systemd-udev-settle.service
 # Runs before the app itself, which reads local files from

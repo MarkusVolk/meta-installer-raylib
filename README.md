@@ -154,15 +154,24 @@ already pulled in, its own `linux-firmware-*` package.
   `embed-initramfs-installer-live.sh` below) — a rescue/recovery
   option that's always there, without a USB stick to keep track of.
   Standalone USB booting also works (`build-initramfs-installer-
-  image.sh`). On boot it reads the `LoaderDevicePartUUID` EFI
-  variable to find a partition labeled `home` **on the disk it was
-  booted from** and mounts it **read-only** at `/mnt/storage` (a
-  rescue tool has no business writing to a system's own data
-  partition), so files there stay available even though the installer
-  itself runs entirely from RAM. That deliberately only applies to
-  the embedded case: booted standalone from a USB stick, the "boot
-  disk" is the stick, and the machine's internal home partition is
-  left alone. `usb-automount` is included too, same as the disk-backed
+  image.sh`). On boot it mounts every partition labeled `home` it
+  finds **read-only** (a rescue tool has no business writing to a
+  system's own data partition), so files there stay available even
+  though the installer itself runs entirely from RAM. The one on the
+  disk it was actually booted from — determined via the
+  `LoaderDevicePartUUID` EFI variable — comes first and gets
+  `/mnt/storage`; a `home` partition on any further disk is added
+  next to it as `/mnt/storage2`, `/mnt/storage3` and so on, and the
+  file browser then starts in `/mnt` so both are one click apart.
+  That second part exists for a machine carrying **more than one
+  complete build system on separate disks**: the installer is booted
+  from one disk's ESP, but the image to install may well be the one
+  just built on the other disk, which a boot-disk-only search left
+  unreachable. Booted standalone from a USB stick, though, only that
+  stick is searched and the machine's internal home partitions are
+  left alone — a stick plugged into an arbitrary machine has no
+  business mounting its data partitions. ("Standalone" here means the
+  transport bus reported for the boot disk is `usb`.) `usb-automount` is included too, same as the disk-backed
   image, for reading a payload off an inserted USB stick instead - and
   since the standalone stick's own ESP is a USB partition as well, it
   gets mounted at `/mnt/usb-<device>` too, so payload files dropped
