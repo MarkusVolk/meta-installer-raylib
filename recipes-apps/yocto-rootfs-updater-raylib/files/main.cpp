@@ -1091,6 +1091,11 @@ struct PartitionSelector {
     // -> the images installed on it, comma separated.
     std::map<std::string, std::string> disk_images;
     int selected_idx = 0;
+    // Bumped by every refresh(), so code that keeps a derived choice in
+    // sync (the boot partition following the rootfs) can tell that the
+    // rows underneath it were rebuilt even if selected_idx did not
+    // move.
+    unsigned generation = 0;
     char mountpoint_buf[256] = "";
     PartitionFilter filter = PartitionFilter::Any;
 
@@ -1098,6 +1103,7 @@ struct PartitionSelector {
         auto all = backend::list_partitions(log_msg);
         partitions.clear();
         idents.clear();
+        ++generation;
 
         // For DisksOnly, find which disk the live installer system
         // itself is running from (PKNAME of whatever partition is
@@ -1367,11 +1373,44 @@ struct AppState {
     char wic_sha256[128] = "";
     PartitionSelector disk_sel; // only the device part is used, no mountpoint
 
+    // What follow_rootfs_with_boot() last synced to, see there.
+    std::string boot_follow_key;
+
     bool show_confirm = false;
     FileBrowserState browser;
 };
 
 static AppState g_app;
+
+// The boot partition follows the rootfs: whenever a different rootfs
+// is selected (by hand, or because a refresh rebuilt the list), the
+// boot selector jumps to the ESP on the same disk, if there is one.
+// With two installations on two drives both lists show two entries,
+// and picking the rootfs on one drive while the boot selector still
+// sits on the other would write the kernel into the wrong ESP - the
+// system on the other drive then boots a kernel that was never meant
+// for it, and the one that was updated keeps its old kernel. Asked
+// for after exactly that kind of mix-up became possible. The user can
+// still override the boot selector afterwards; the sync only runs
+// when the rootfs choice or the boot list itself changes, not every
+// frame, so a deliberate manual pick is not fought.
+static void follow_rootfs_with_boot() {
+    const backend::PartitionInfo* root = g_app.rootfs_sel.selected_partition();
+    std::string key = (root ? root->path + "|" + root->pkname : std::string("-")) + "|" +
+                      std::to_string(g_app.boot_sel.generation);
+    if (key == g_app.boot_follow_key) return;
+    g_app.boot_follow_key = key;
+    if (!root || root->pkname.empty()) return;
+    for (size_t i = 0; i < g_app.boot_sel.partitions.size(); ++i) {
+        if (g_app.boot_sel.partitions[i].pkname != root->pkname) continue;
+        if ((int)i != g_app.boot_sel.selected_idx) {
+            g_app.boot_sel.selected_idx = (int)i;
+            log_msg("Boot partition set to " + g_app.boot_sel.partitions[i].name +
+                    " (same disk as " + root->name + ")");
+        }
+        return;
+    }
+}
 
 // Loaded from /etc/yocto-rootfs-updater-raylib/config.toml at startup
 // (see load_config() in main()), with these hardcoded fallbacks if
@@ -2028,6 +2067,7 @@ static void draw_ui() {
     y += ROW + GAP * 2;
 
     y = draw_partition_selector("RootFS / \"platform\" Partition", g_app.rootfs_sel, x, y, FORM_W, 10, true, /*show_mountpoint=*/false);
+    follow_rootfs_with_boot();
 
     GuiLabel({x, y, 140 * g_ui_scale, ROW}, "Excludes:");
     text_field(4, {x + 150 * g_ui_scale, y, FORM_W - 150 * g_ui_scale, ROW}, g_app.excludes_buf, sizeof(g_app.excludes_buf));
