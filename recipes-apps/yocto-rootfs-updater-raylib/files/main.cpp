@@ -1409,14 +1409,34 @@ static void run_pipeline(AppState snapshot) {
             backend::do_mount(kernel_device, kernel_mp, log_msg);
         }
 
+        log_msg("Scanning rootfs tarball...");
+        set_progress(0, 1, "Scanning tarball...");
+        backend::TarStats tar_stats = backend::scan_tar(tar_path, set_progress, &g_cancel_requested);
+        long long capacity = backend::filesystem_capacity(rootfs_mp);
+        log_msg("Tarball: " + std::to_string(tar_stats.entries) + " entries, at least " +
+                backend::human_size((double)tar_stats.bytes) + " unpacked; partition holds " +
+                backend::human_size((double)capacity) + ".");
+        if (tar_stats.bytes > capacity)
+            throw backend::OperationError("Rootfs does not fit: needs at least " +
+                                           backend::human_size((double)tar_stats.bytes) + ", " +
+                                           rootfs_device + " holds " +
+                                           backend::human_size((double)capacity) + ".");
+
         std::vector<backend::NestedExcludeBackup> nested_backups = backend::backup_nested_excludes(rootfs_mp, excludes, log_msg);
 
         log_msg("Clearing rootfs partition (protected mountpoints are skipped)...");
         set_progress(0, 1, "Clearing rootfs partition...");
         backend::clear_directory(rootfs_mp, excludes, log_msg);
 
+        long long available = backend::filesystem_available(rootfs_mp);
+        if (tar_stats.bytes > available)
+            throw backend::OperationError("Rootfs does not fit: needs at least " +
+                                           backend::human_size((double)tar_stats.bytes) + ", only " +
+                                           backend::human_size((double)available) +
+                                           " free on " + rootfs_device + " after clearing.");
+
         log_msg("Extracting rootfs...");
-        backend::extract_tar(tar_path, rootfs_mp, set_progress, log_msg, &g_cancel_requested);
+        backend::extract_tar(tar_path, rootfs_mp, tar_stats.entries, set_progress, log_msg, &g_cancel_requested);
 
         backend::restore_nested_excludes(rootfs_mp, nested_backups, log_msg);
 

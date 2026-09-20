@@ -15,6 +15,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <functional>
 #include <map>
 #include <optional>
@@ -832,18 +834,65 @@ inline void download(const std::string& url, const std::string& dest,
     }
 }
 
-inline long long count_tar_entries(const std::string& tar_path) {
-    ProcResult r = exec_capture({"tar", "-tzf", tar_path});
-    if (r.exit_code != 0) throw OperationError("Tarball appears to be corrupt:\n" + r.output);
-    long long count = 0;
-    for (char c : r.output) if (c == '\n') ++count;
-    return count;
+struct TarStats {
+    long long entries = 0;
+    long long bytes = 0;
+};
+
+inline TarStats scan_tar(const std::string& tar_path, const ProgressFn& progress,
+                         std::atomic<bool>* cancel_flag) {
+    TarStats st;
+    std::string tail;
+    int rc = exec_stream_lines(
+        {"tar", "-tzvf", tar_path},
+        [&](const std::string& line) {
+            std::istringstream is(line);
+            std::string mode, owner, size;
+            is >> mode >> owner >> size;
+            if (mode.empty() || (mode[0] != '-' && mode[0] != 'd' && mode[0] != 'l' &&
+                                 mode[0] != 'h' && mode[0] != 'c' && mode[0] != 'b' && mode[0] != 'p')) {
+                tail = line;
+                return;
+            }
+            ++st.entries;
+            char* end = nullptr;
+            long long n = strtoll(size.c_str(), &end, 10);
+            if (end && *end == '\0' && n > 0) st.bytes += (n + 4095) / 4096 * 4096;
+            if (progress && st.entries % 500 == 0)
+                progress(0, 1, "Scanning tarball: " + std::to_string(st.entries) + " entries, " +
+                                   human_size((double)st.bytes));
+        },
+        cancel_flag);
+    if (cancel_flag && cancel_flag->load()) throw OperationError("Installation cancelled.");
+    if (rc != 0) throw OperationError("Tarball appears to be corrupt:\n" + tail);
+    return st;
 }
 
-inline void extract_tar(const std::string& tar_path, const std::string& mountpoint,
+inline long long filesystem_capacity(const std::string& path) {
+    struct statvfs vfs{};
+    if (statvfs(path.c_str(), &vfs) != 0) throw OperationError("statvfs failed for " + path);
+    return (long long)(vfs.f_blocks - (vfs.f_bfree - vfs.f_bavail)) * (long long)vfs.f_frsize;
+}
+
+inline long long filesystem_available(const std::string& path) {
+    struct statvfs vfs{};
+    if (statvfs(path.c_str(), &vfs) != 0) throw OperationError("statvfs failed for " + path);
+    return (long long)vfs.f_bavail * (long long)vfs.f_frsize;
+}
+
+inline long long block_device_size(const std::string& device) {
+    int fd = open(device.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) throw OperationError("Cannot open " + device + ": " + strerror(errno));
+    unsigned long long bytes = 0;
+    int rc = ioctl(fd, BLKGETSIZE64, &bytes);
+    close(fd);
+    if (rc != 0) throw OperationError("Cannot determine size of " + device + ": " + strerror(errno));
+    return (long long)bytes;
+}
+
+inline void extract_tar(const std::string& tar_path, const std::string& mountpoint, long long total,
                          const ProgressFn& progress, const LogFn& log,
                          std::atomic<bool>* cancel_flag) {
-    long long total = count_tar_entries(tar_path);
     if (total <= 0) total = 1;
     log("Extracting " + std::to_string(total) + " entries...");
     long long done = 0;
@@ -887,6 +936,10 @@ inline void write_disk_image(const std::string& source, bool is_url, const std::
         if (stat(source.c_str(), &st) != 0) throw OperationError("File not found: " + source);
         total = st.st_size;
     }
+    long long disk = block_device_size(device);
+    if (total > disk)
+        throw OperationError("Image does not fit: " + human_size((double)total) + " image, " +
+                             human_size((double)disk) + " disk (" + device + ").");
     if (total <= 0) total = 1;
 
     std::string ofArg = "of=" + device;
