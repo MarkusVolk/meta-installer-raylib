@@ -2910,6 +2910,21 @@ static void draw_ui() {
                 std::string kernel_src = current_source_display(g_app.kernel_source_kind, g_app.kernel_local_path, g_app.kernel_http_url, g_app.kernel_url);
                 msg += "\n\nThe kernel will also be updated, on:\n" +
                        g_app.boot_sel.selected_display() + "\nfrom: " + kernel_src;
+                // follow_rootfs_with_boot() keeps the two selectors on
+                // one disk, but a manual boot choice after that is
+                // respected, so the pair can still be split up. Say so
+                // here, at the last point where it can be corrected:
+                // the rootfs on one drive with the kernel on the
+                // other's ESP is the exact mix-up that made the
+                // follow behaviour necessary, and nothing about the
+                // two lines above makes it obvious.
+                const backend::PartitionInfo* root = g_app.rootfs_sel.selected_partition();
+                const backend::PartitionInfo* boot = g_app.boot_sel.selected_partition();
+                if (root && boot && !root->pkname.empty() && root->pkname != boot->pkname) {
+                    msg += "\n\nWARNING: rootfs and boot partition are on different disks (" +
+                           root->pkname + " and " + boot->pkname + ")!\n"
+                           "The kernel would be written to the boot partition of another installation.";
+                }
             }
         } else {
             std::string dev = g_app.disk_sel.get_device();
