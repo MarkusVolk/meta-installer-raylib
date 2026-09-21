@@ -7,13 +7,13 @@ instead of a display manager or desktop environment. Fully usable
 with keyboard alone (Tab + Enter reaches and activates everything,
 mouse optional) as well as touch/mouse.
 
-![Screenshot of the installer's main screen](docs/screenshot.png)
+![The installer in RootFS Update mode](docs/screenshot-rootfs-update.png)
 
-*Placeholder reconstructed from the layer's own theme/layout code,
-not yet a real capture. To take one on actual hardware: set
-`debug_mode = true` in `config.toml`, then press F12 in the running
-app — a PNG lands in `/mnt/storage` (if writable) or `/tmp`, path
-shown in the log.*
+![The installer in Full Install mode](docs/screenshot-full-install.png)
+
+*To take a screenshot on the running installer: set `debug_mode = true`
+in `config.toml`, then press F12 — a PNG lands in `/mnt/storage` (if
+writable) or `/tmp`, path shown in the log.*
 
 ## Dependencies
 
