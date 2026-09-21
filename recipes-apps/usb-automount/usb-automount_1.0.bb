@@ -1,6 +1,6 @@
 SUMMARY = "Auto-mounts USB-attached block device partitions to /mnt/usb-<device>"
 DESCRIPTION = "A udev rule triggers a per-device systemd service on \
-every USB flash drive partition that appears, mounting it read-only \
+every USB flash drive partition that appears, mounting it read-write (read-only fallback) \
 at /mnt/usb-<kernel-device-name> - matches this project's own \
 existing app-side auto-select logic (main.cpp's \
 discover_local_file_candidate_dirs(), any /mnt/ subdirectory whose \

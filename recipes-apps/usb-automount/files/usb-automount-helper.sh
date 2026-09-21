@@ -15,8 +15,10 @@
 # skips the bare "usb" name on purpose so the link doesn't show up as
 # a duplicate of the real mount point it points to.
 #
-# Mounted read-only throughout - a rescue/installer context reads
-# payload files off external media, never writes back to it.
+# Mounted read-write, falling back to read-only when the filesystem
+# refuses (write-protected media, an unclean NTFS/exFAT volume): a
+# stick is also the place to drop logs or a config onto, not just a
+# payload source.
 set -e
 
 ACTION="$1"
@@ -46,7 +48,10 @@ case "$ACTION" in
             exit 0
         fi
         mkdir -p "$MP"
-        mount -o ro "$DEV" "$MP"
+        if ! mount "$DEV" "$MP"; then
+            echo "I: read-write mount of $DEV failed - falling back to read-only."
+            mount -o ro "$DEV" "$MP"
+        fi
         if ! link_valid; then
             rm -f "$LINK" 2>/dev/null || true
             ln -s "$MP" "$LINK"
