@@ -1287,6 +1287,11 @@ static std::string elide_to_width(const std::string& s, float max_w) {
     return s.substr(0, lo) + "...";
 }
 
+// Defined below, next to discover_local_file_candidate_dirs(): the
+// Refresh buttons rescan for images too, so a stick plugged in after
+// start is picked up.
+static void autoselect_local_files();
+
 static float draw_partition_selector(const char* title, PartitionSelector& sel, float x, float y,
                                       float w, int field_id_base, bool enabled,
                                       bool show_mountpoint = true) {
@@ -1327,7 +1332,11 @@ static float draw_partition_selector(const char* title, PartitionSelector& sel, 
     int active = sel.selected_idx < 0 ? 0 : sel.selected_idx;
     GuiComboBox({x, y, COMBO_W, ROW}, combo_text.c_str(), &active);
     if (!sel.partitions.empty()) sel.selected_idx = active;
-    if (focusable_button(field_id_base + 2, {x + w - BTNW, y, BTNW, ROW}, "Refresh")) { g_probe_cache.clear(); sel.refresh(); }
+    if (focusable_button(field_id_base + 2, {x + w - BTNW, y, BTNW, ROW}, "Refresh")) {
+        g_probe_cache.clear();
+        sel.refresh();
+        autoselect_local_files();
+    }
     y += ROW + GAP;
 
     if (show_mountpoint) {
@@ -1462,6 +1471,35 @@ static std::vector<std::string> discover_local_file_candidate_dirs() {
         closedir(mnt);
     }
     return dirs;
+}
+
+// Auto-pick the most recently modified matching file sitting in one of
+// those directories. Called at startup and from every Refresh button,
+// since a stick is often plugged in only once the installer is already
+// up. A field is filled while it is empty or still holds what an
+// earlier run put there, so a path typed or browsed to by hand is
+// never overwritten.
+static void autoselect_local_files() {
+    static std::string last_rootfs, last_wic, last_kernel;
+    auto dirs = discover_local_file_candidate_dirs();
+    auto apply = [](char* field, size_t cap, std::string& last,
+                    const std::string& found, const char* what) {
+        if (found.empty() || found == field) return;
+        if (field[0] != '\0' && field != last) return;
+        strncpy(field, found.c_str(), cap - 1);
+        field[cap - 1] = '\0';
+        last = found;
+        log_msg(std::string("Auto-selected local ") + what + ": " + found);
+    };
+    std::string rootfs = find_latest_matching_file(dirs, {".tar.gz", ".tgz"});
+    apply(g_app.rootfs_local_path, sizeof(g_app.rootfs_local_path), last_rootfs, rootfs, "rootfs");
+    std::string wic = find_latest_matching_file(dirs, {".wic"});
+    apply(g_app.wic_local_path, sizeof(g_app.wic_local_path), last_wic, wic, "wic image");
+    std::string kernel;
+    if (!rootfs.empty()) kernel = sibling_kernel_for(rootfs, g_app.kernel_target_name);
+    if (kernel.empty() && !wic.empty()) kernel = sibling_kernel_for(wic, g_app.kernel_target_name);
+    if (kernel.empty()) kernel = find_exact_named_file(dirs, g_app.kernel_target_name);
+    apply(g_app.kernel_local_path, sizeof(g_app.kernel_local_path), last_kernel, kernel, "kernel image");
 }
 
 // ---------------------------------------------------------------------
@@ -3563,35 +3601,13 @@ int main(void) {
         log_msg("Storage partition detected, file browser will start in " + browser_dir_fallback + ".");
     }
 
-    // Auto-pick the most recently modified matching file already
-    // sitting in the default browser directory, or a removable USB
-    // stick this image's own /init may have mounted (see
-    // discover_local_file_candidate_dirs()), if any - the common
-    // case (a stick built via build-payload-image.sh, a file dropped
-    // into /mnt/storage from a desktop system, or a separate USB
-    // stick with the file in its root directory) then needs no
-    // manual browsing at all. Only pre-fills the path text field;
-    // still fully editable/re-browsable, this is a convenience
-    // default, not a lock-in.
-    auto local_file_candidate_dirs = discover_local_file_candidate_dirs();
-    std::string auto_rootfs = find_latest_matching_file(local_file_candidate_dirs, {".tar.gz", ".tgz"});
-    if (!auto_rootfs.empty()) {
-        strncpy(g_app.rootfs_local_path, auto_rootfs.c_str(), sizeof(g_app.rootfs_local_path) - 1);
-        log_msg("Auto-selected local rootfs: " + auto_rootfs);
-    }
-    std::string auto_wic = find_latest_matching_file(local_file_candidate_dirs, {".wic"});
-    if (!auto_wic.empty()) {
-        strncpy(g_app.wic_local_path, auto_wic.c_str(), sizeof(g_app.wic_local_path) - 1);
-        log_msg("Auto-selected local wic image: " + auto_wic);
-    }
-    std::string auto_kernel;
-    if (!auto_rootfs.empty()) auto_kernel = sibling_kernel_for(auto_rootfs, cfg_kernel_target);
-    if (auto_kernel.empty() && !auto_wic.empty()) auto_kernel = sibling_kernel_for(auto_wic, cfg_kernel_target);
-    if (auto_kernel.empty()) auto_kernel = find_exact_named_file(local_file_candidate_dirs, cfg_kernel_target);
-    if (!auto_kernel.empty()) {
-        strncpy(g_app.kernel_local_path, auto_kernel.c_str(), sizeof(g_app.kernel_local_path) - 1);
-        log_msg("Auto-selected local kernel image: " + auto_kernel);
-    }
+    // Auto-pick a rootfs/wic/kernel already sitting in one of the
+    // candidate directories, so the common case (a stick built via
+    // build-payload-image.sh, a file dropped into /mnt/storage from a
+    // desktop system, or a separate USB stick with the file in its
+    // root directory) needs no manual browsing at all.
+    strncpy(g_app.kernel_target_name, cfg_kernel_target.c_str(), sizeof(g_app.kernel_target_name));
+    autoselect_local_files();
 
     // http_default_dir prefill - same "only if actually configured"
     // opt-in as local_default_dir above, applied consistently across
@@ -3615,7 +3631,6 @@ int main(void) {
     g_app.boot_sel.filter = PartitionFilter::BootLike;
     g_app.boot_sel.refresh();
     strncpy(g_app.boot_sel.mountpoint_buf, cfg_boot_mp.c_str(), sizeof(g_app.boot_sel.mountpoint_buf));
-    strncpy(g_app.kernel_target_name, cfg_kernel_target.c_str(), sizeof(g_app.kernel_target_name));
     g_app.disk_sel.filter = PartitionFilter::DisksOnly;
     g_app.disk_sel.refresh();
 
