@@ -3283,16 +3283,55 @@ static bool get_preferred_display_mode(int* outW, int* outH) {
 // rlGetVersion() == RL_OPENGL_SOFTWARE is the clean runtime check for
 // "are we on that backend", so the same binary stays correct if this
 // layer is ever built with the opengl DISTRO_FEATURE on instead.
+//
+// The red/blue swap below is the second half of the same story: the
+// rasterizer's sw_framebuffer_output_fast() unconditionally emits
+// BGRA (rlsw.h's own SW_FRAMEBUFFER_OUTPUT_BGRA, on by default),
+// which is exactly what the DRM dumb buffer wants (XRGB8888, little
+// endian) and therefore right on screen - but swReadPixels() takes
+// the same path, so the bytes LoadImageFromScreen() hands back are
+// BGRA while their Image.format claims R8G8B8A8. The display is
+// correct, only the exported PNG came out with red and blue
+// exchanged; undo it here rather than in the image the display uses.
+// Screenshots go to a USB stick first: download_staging_dir() picks
+// /mnt/storage, which on the initramfs image is mounted read-only by
+// initramfs-home-mount, and /tmp is RAM - a capture left there is
+// gone with the next reboot and can't be carried to another machine.
+// The bare "/mnt/usb" symlink is tried before the real usb-<dev>
+// mounts it points at, so a single-partition stick (the usual case)
+// gets the shortest path. Falls back to the staging directory when
+// no writable stick is around.
+static std::string screenshot_dir() {
+    std::vector<std::string> candidates = { "/mnt/usb" };
+    DIR* mnt = opendir("/mnt");
+    if (mnt) {
+        struct dirent* e;
+        while ((e = readdir(mnt)) != nullptr) {
+            std::string name = e->d_name;
+            if (name != "usb" && name.rfind("usb", 0) == 0) candidates.push_back("/mnt/" + name);
+        }
+        closedir(mnt);
+    }
+    for (const std::string& dir : candidates) {
+        if (backend::is_mountpoint(dir) && backend::is_writable_mountpoint(dir)) return dir;
+    }
+    return download_staging_dir();
+}
+
 static void maybe_take_screenshot() {
     if (!g_cfg_debug_mode || !IsKeyPressed(KEY_F12)) return;
     Image img = LoadImageFromScreen();
-    if (rlGetVersion() == RL_OPENGL_SOFTWARE) ImageFlipVertical(&img);
+    if (rlGetVersion() == RL_OPENGL_SOFTWARE) {
+        ImageFlipVertical(&img);
+        unsigned char* px = (unsigned char*)img.data;
+        for (int i = 0; i < img.width*img.height; i++) std::swap(px[4*i], px[4*i + 2]);
+    }
     char name[128];
     time_t now = time(nullptr);
     struct tm tmv;
     localtime_r(&now, &tmv);
     strftime(name, sizeof(name), "screenshot-%Y%m%d-%H%M%S.png", &tmv);
-    std::string path = download_staging_dir() + "/" + name;
+    std::string path = screenshot_dir() + "/" + name;
     bool ok = ExportImage(img, path.c_str());
     UnloadImage(img);
     log_msg(ok ? ("Screenshot saved: " + path) : ("Screenshot FAILED: " + path));
