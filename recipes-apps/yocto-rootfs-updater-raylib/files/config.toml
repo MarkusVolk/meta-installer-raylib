@@ -36,6 +36,10 @@ boot_mountpoint = "/mnt/boot"
 
 kernel_target_name = "bzImage"
 
+# Write .wic images with bmap-writer when it is installed and a .bmap
+# sits next to the image; false always uses dd.
+#wic_use_bmap = true
+
 # The kernel image section starts enabled so that a rootfs update also
 # brings the matching kernel and the target keeps booting. Set to false
 # to start with it disabled; it stays toggleable per run either way.

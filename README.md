@@ -58,7 +58,8 @@ by `BBPATH` order, so avoid having both in `bblayers.conf`.
 
 The `meta-oe` layer, from
 [meta-openembedded](https://github.com/openembedded/meta-openembedded)
-(for `iwd`), is only needed if WiFi support is turned on — see below.
+(for `iwd`), is only needed if WiFi support is turned on, or if the
+optional bmap-writer path for full installs is — both see below.
 
 ## Graphics: DRM, no X11/Wayland, software rendering by default
 
@@ -129,6 +130,42 @@ without it, and as modules those would never reach the image, since
 the distro deliberately blocks the `kernel-modules` umbrella package. Any other card — including a *different* RTW89
 variant — needs its own kernel config addition (driver) and, if not
 already pulled in, its own `linux-firmware-*` package.
+
+## Full installs with bmap-writer (optional)
+
+A full install writes the `.wic` with `dd` by default: the whole
+image, byte for byte, streamed straight from `curl` for HTTP(S)
+sources. `bmaptool` — the usual way to write only the blocks a sparse
+wic actually contains — was deliberately left out, since it needs
+Python 3 on the installer image.
+
+[bmap-writer](https://github.com/embetrix/bmap-writer) from `meta-oe`
+is a small C++ reimplementation of the writing half (libarchive +
+tinyxml2, no Python) and can be enabled instead, off by default so
+that meta-openembedded stays an optional layer here:
+
+```
+PACKAGECONFIG:append:pn-yocto-rootfs-updater-raylib = " bmap"
+```
+
+Nothing links against it; the installer only looks for the binary at
+runtime. When it is installed and a `<image>.wic.bmap` exists next to
+the wic (add `wic.bmap` to the `IMAGE_FSTYPES` of the image to be
+installed; `build-payload-image.sh` bundles it along with the
+`.wic`), only the mapped blocks get
+written, each one SHA256-verified against the bmap — on a sparse
+multi-GB image that is seconds instead of minutes, and a corrupt
+download is caught per block, which the streaming `curl | dd` path
+cannot do at all. For HTTP(S) sources the small `.bmap` is fetched
+first and the image itself still streams (`bmap-writer -`). If the
+binary or the `.bmap` is missing, it logs that and uses `dd` as before;
+`wic_use_bmap = false` in `config.toml` forces `dd` regardless.
+
+bmap-writer prints no progress of its own, so the bar is driven by
+the kernel's write counter for the target disk
+(`/sys/class/block/<dev>/stat`), which needs nothing from the kernel
+config. Note that bmap-writer is GPL-3.0-only, in case your image
+sets `INCOMPATIBLE_LICENSE`.
 
 ## Two images
 

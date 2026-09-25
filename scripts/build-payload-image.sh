@@ -56,7 +56,7 @@ usage() {
     echo "  payload_output_dir (env or ~/.config/build-payload-image.conf)" >&2
     echo "  resolves a bare -o filename - see script header." >&2
     echo "  Without -p: payload_source_dir auto-discovers" >&2
-    echo "  *.rootfs.tar.gz / *.wic symlinks there instead." >&2
+    echo "  *.rootfs.tar.gz / *.wic / *.wic.bmap symlinks there instead." >&2
     exit 1
 }
 
@@ -199,7 +199,7 @@ else
     }
     echo "No payload file given, searching in ${payload_source_dir}..."
     FOUND=""
-    for pattern in "*.rootfs.tar.gz" "*.wic"; do
+    for pattern in "*.rootfs.tar.gz" "*.wic" "*.wic.bmap"; do
         for f in "$payload_source_dir"/$pattern; do
             [ -e "$f" ] && [ -L "$f" ] && FOUND="$FOUND $f"
         done

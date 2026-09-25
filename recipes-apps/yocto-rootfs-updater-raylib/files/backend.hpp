@@ -1172,6 +1172,189 @@ inline void write_disk_image(const std::string& source, bool is_url, const std::
     run_checked({"sync"}, log);
 }
 
+
+inline bool tool_in_path(const std::string& name) {
+    const char* path = getenv("PATH");
+    std::string dirs = path ? path : "/usr/sbin:/usr/bin:/sbin:/bin";
+    size_t pos = 0;
+    while (pos <= dirs.size()) {
+        size_t colon = dirs.find(':', pos);
+        std::string dir = dirs.substr(pos, colon == std::string::npos ? std::string::npos : colon - pos);
+        if (!dir.empty() && access((dir + "/" + name).c_str(), X_OK) == 0) return true;
+        if (colon == std::string::npos) break;
+        pos = colon + 1;
+    }
+    return false;
+}
+
+inline bool bmap_writer_available() { return tool_in_path("bmap-writer"); }
+
+struct BmapInfo {
+    long long image_size = 0;
+    long long block_size = 0;
+    long long mapped_blocks = 0;
+    long long mapped_bytes() const { return mapped_blocks * block_size; }
+};
+
+inline BmapInfo parse_bmap_file(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) throw OperationError("Cannot read bmap file: " + path);
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto tag_value = [&](const char* tag) -> long long {
+        std::string open = std::string("<") + tag + ">";
+        std::string close = std::string("</") + tag + ">";
+        size_t a = content.find(open);
+        if (a == std::string::npos) throw OperationError(std::string("bmap file lacks <") + tag + ">: " + path);
+        a += open.size();
+        size_t b = content.find(close, a);
+        if (b == std::string::npos) throw OperationError(std::string("bmap file: unterminated <") + tag + ">: " + path);
+        std::string v = content.substr(a, b - a);
+        size_t i = 0;
+        while (i < v.size() && !isdigit((unsigned char)v[i])) i++;
+        return atoll(v.c_str() + i);
+    };
+    BmapInfo info;
+    info.image_size = tag_value("ImageSize");
+    info.block_size = tag_value("BlockSize");
+    info.mapped_blocks = tag_value("MappedBlocksCount");
+    if (info.image_size <= 0 || info.block_size <= 0 || info.mapped_blocks <= 0)
+        throw OperationError("bmap file has implausible header values: " + path);
+    return info;
+}
+
+inline long long device_sectors_written(const std::string& device) {
+    std::string name = device;
+    size_t slash = name.rfind('/');
+    if (slash != std::string::npos) name = name.substr(slash + 1);
+    std::ifstream f("/sys/class/block/" + name + "/stat");
+    if (!f) return -1;
+    long long v[7] = {0};
+    for (int i = 0; i < 7; i++) {
+        if (!(f >> v[i])) return -1;
+    }
+    return v[6];
+}
+
+inline void write_disk_image_bmap(const std::string& source, bool is_url, const std::string& bmap_path,
+                                   const std::string& device, const LogFn& log,
+                                   const ProgressFn& progress, std::atomic<bool>* cancel_flag) {
+    BmapInfo info = parse_bmap_file(bmap_path);
+    long long disk = block_device_size(device);
+    if (info.image_size > disk)
+        throw OperationError("Image does not fit: " + human_size((double)info.image_size) + " image, " +
+                             human_size((double)disk) + " disk (" + device + ").");
+    long long total = info.mapped_bytes();
+    if (total <= 0) total = 1;
+    log("bmap: " + human_size((double)info.image_size) + " image, " +
+        human_size((double)total) + " mapped (" + std::to_string(info.mapped_blocks) + " blocks of " +
+        std::to_string(info.block_size) + " bytes)");
+
+    int outPipe[2];
+    if (pipe(outPipe) != 0) throw OperationError("pipe() failed");
+    int flags = fcntl(outPipe[0], F_GETFL, 0);
+    fcntl(outPipe[0], F_SETFL, flags | O_NONBLOCK);
+
+    pid_t curlPid = -1, writerPid;
+    if (is_url) {
+        int pipefd[2];
+        if (pipe(pipefd) != 0) throw OperationError("pipe() failed");
+        log("$ curl -sL --fail '" + source + "' | bmap-writer - " + bmap_path + " " + device);
+        curlPid = fork();
+        if (curlPid == 0) {
+            dup2(pipefd[1], STDOUT_FILENO);
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) dup2(devnull, STDERR_FILENO);
+            close(pipefd[0]); close(pipefd[1]); close(outPipe[0]); close(outPipe[1]);
+            execlp("curl", "curl", "-sL", "--fail", source.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+        writerPid = fork();
+        if (writerPid == 0) {
+            dup2(pipefd[0], STDIN_FILENO);
+            dup2(outPipe[1], STDOUT_FILENO);
+            dup2(outPipe[1], STDERR_FILENO);
+            close(pipefd[0]); close(pipefd[1]); close(outPipe[0]); close(outPipe[1]);
+            execlp("bmap-writer", "bmap-writer", "-", bmap_path.c_str(), device.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+        close(pipefd[0]); close(pipefd[1]);
+    } else {
+        log("$ bmap-writer " + source + " " + bmap_path + " " + device);
+        writerPid = fork();
+        if (writerPid == 0) {
+            dup2(outPipe[1], STDOUT_FILENO);
+            dup2(outPipe[1], STDERR_FILENO);
+            close(outPipe[0]); close(outPipe[1]);
+            execlp("bmap-writer", "bmap-writer", source.c_str(), bmap_path.c_str(), device.c_str(),
+                   (char*)nullptr);
+            _exit(127);
+        }
+    }
+    close(outPipe[1]);
+    if (writerPid < 0) throw OperationError("fork() failed");
+
+    long long base_sectors = device_sectors_written(device);
+    bool done = false;
+    std::string partial_line, tool_output;
+    while (!done) {
+        if (cancel_flag && cancel_flag->load()) {
+            kill(writerPid, SIGTERM);
+            if (curlPid > 0) kill(curlPid, SIGTERM);
+        }
+        char buf[4096];
+        ssize_t n;
+        while ((n = read(outPipe[0], buf, sizeof(buf))) > 0) {
+            partial_line.append(buf, (size_t)n);
+            size_t sep;
+            while ((sep = partial_line.find_first_of("\r\n")) != std::string::npos) {
+                std::string line = partial_line.substr(0, sep);
+                partial_line.erase(0, sep + 1);
+                if (line.empty()) continue;
+                log("  bmap-writer: " + line);
+                tool_output += line + "\n";
+            }
+        }
+        if (progress) {
+            long long now = device_sectors_written(device);
+            if (base_sectors >= 0 && now >= base_sectors) {
+                long long written = (now - base_sectors) * 512;
+                if (written > total) written = total;
+                progress(written, total, "Writing image (bmap): " + human_size((double)written) + " / " +
+                                              human_size((double)total));
+            } else {
+                progress(0, 1, "Writing image (bmap)...");
+            }
+        }
+        int status = 0;
+        pid_t r = waitpid(writerPid, &status, WNOHANG);
+        if (r == writerPid) {
+            done = true;
+            if (curlPid > 0) { int s2 = 0; waitpid(curlPid, &s2, 0); }
+            while ((n = read(outPipe[0], buf, sizeof(buf))) > 0) partial_line.append(buf, (size_t)n);
+            if (!partial_line.empty()) { log("  bmap-writer: " + partial_line); tool_output += partial_line + "\n"; }
+            close(outPipe[0]);
+            if (cancel_flag && cancel_flag->load()) throw OperationError("Installation cancelled.");
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                std::string why = code == 127 ? "bmap-writer not found" : "bmap-writer failed (exit code " + std::to_string(code) + ")";
+                std::string tail;
+                size_t cut = tool_output.size();
+                for (int lines = 0; lines < 2 && cut > 0; lines++) {
+                    size_t nl = tool_output.rfind('\n', cut - 1);
+                    cut = (nl == std::string::npos) ? 0 : nl;
+                }
+                tail = tool_output.substr(cut);
+                while (!tail.empty() && (tail.front() == '\n')) tail.erase(0, 1);
+                throw OperationError(why + (tail.empty() ? "" : ":\n" + tail));
+            }
+        } else {
+            usleep(50000);
+        }
+    }
+    if (progress) progress(total, total, "Image written, syncing...");
+    run_checked({"sync"}, log);
+}
+
 // Only for marker checks in probe_rootfs: checks whether a path
 // entry exists (even as a symlink) without resolving it. Needed
 // because e.g. /etc/os-release is often a symlink to

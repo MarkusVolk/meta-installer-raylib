@@ -35,6 +35,9 @@ RDEPENDS:${PN} = "\
     e2fsprogs-tune2fs \
 "
 
+PACKAGECONFIG ??= ""
+PACKAGECONFIG[bmap] = ",,,bmap-writer"
+
 inherit cmake systemd pkgconfig
 
 SYSTEMD_SERVICE:${PN} = "yocto-rootfs-updater-raylib.service"

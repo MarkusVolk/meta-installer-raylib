@@ -7,7 +7,7 @@
 # input .wic by default:
 #payload_output_dir="/home/you/images-with-payload"
 
-# Auto-discover payload files (*.rootfs.tar.gz / *.wic) here via
+# Auto-discover payload files (*.rootfs.tar.gz / *.wic / *.wic.bmap) here via
 # Yocto's stable deploy symlinks - typically the tmp/deploy/images/
 # <machine>/ of a DIFFERENT build (your actual target system, not this
 # installer). <machine> is your real MACHINE name (e.g.

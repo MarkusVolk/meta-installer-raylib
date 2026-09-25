@@ -129,6 +129,7 @@ static WifiScreenState g_wifi_screen;
 // g_reboot_requested.
 static std::atomic<bool> g_exit_requested{false};
 static bool g_cfg_debug_mode = false;
+static bool g_cfg_wic_use_bmap = true;
 // Set once at startup (see main()) via a plain access() check for
 // iwctl (iwd's own client tool) - this project's own opt-in WiFi
 // support (see installer-minimal-raylib.conf's own comments on the
@@ -1735,7 +1736,7 @@ static void run_pipeline(AppState snapshot) {
 // needed, dd writes directly to the raw disk including the partition
 // table.
 static void run_wic_pipeline(AppState snapshot) {
-    std::string tmp_wic_download;
+    std::string tmp_wic_download, tmp_bmap_download;
 
     auto finish = [&](bool had_error, const std::string& err) {
         std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -1769,6 +1770,9 @@ static void run_wic_pipeline(AppState snapshot) {
         // property) if the user actually asked for verification - a
         // real pre-write check is worth that trade-off, a
         // this-only-warns-after-the-fact one wouldn't be.
+        std::string bmap_candidate = source + ".bmap";
+        bool bmap_candidate_is_url = is_url;
+
         if (is_url && want_checksum) {
             std::string staging_dir = download_staging_dir();
             log_msg("Download staging directory: " + staging_dir);
@@ -1794,9 +1798,35 @@ static void run_wic_pipeline(AppState snapshot) {
             log_msg("Checksum OK.");
         }
 
+        std::string bmap_path;
+        if (g_cfg_wic_use_bmap && backend::bmap_writer_available()) {
+            if (!bmap_candidate_is_url) {
+                if (backend::file_exists(bmap_candidate)) bmap_path = bmap_candidate;
+                else log_msg("No " + bmap_candidate + " next to the image - writing with dd.");
+            } else {
+                std::string staging_dir = download_staging_dir();
+                tmp_bmap_download = staging_dir + "/yocto_wic_install.bmap";
+                try {
+                    backend::download(bmap_candidate, tmp_bmap_download, nullptr, &g_cancel_requested);
+                    bmap_path = tmp_bmap_download;
+                } catch (const backend::OperationError& e) {
+                    if (g_cancel_requested.load()) throw;
+                    log_msg("No bmap file at " + bmap_candidate + " (" + e.what() + ") - writing with dd.");
+                }
+            }
+        } else if (g_cfg_wic_use_bmap) {
+            log_msg("bmap-writer not installed - writing with dd.");
+        }
+
         log_msg("Writing wic image to " + device + " ...");
         set_progress(0, 1, "Starting...");
-        backend::write_disk_image(source, is_url, device, log_msg, set_progress, &g_cancel_requested);
+        if (!bmap_path.empty()) {
+            log_msg("Using bmap file: " + bmap_path);
+            backend::write_disk_image_bmap(source, is_url, bmap_path, device, log_msg, set_progress,
+                                           &g_cancel_requested);
+        } else {
+            backend::write_disk_image(source, is_url, device, log_msg, set_progress, &g_cancel_requested);
+        }
 
         set_progress(1, 1, "Done. Rebooting shortly...");
         finish(false, "");
@@ -1807,6 +1837,7 @@ static void run_wic_pipeline(AppState snapshot) {
     }
 
     if (!tmp_wic_download.empty()) unlink(tmp_wic_download.c_str());
+    if (!tmp_bmap_download.empty()) unlink(tmp_bmap_download.c_str());
 }
 
 // ---------------------------------------------------------------------
@@ -3571,6 +3602,7 @@ int main(void) {
     }
     g_app.kernel_enabled = cfg_get("kernel_enabled_default", "true") != "false";
     g_cfg_debug_mode = cfg_get("debug_mode", "false") == "true";
+    g_cfg_wic_use_bmap = cfg_get("wic_use_bmap", "true") != "false";
     g_wifi_available = (access("/usr/bin/iwctl", X_OK) == 0);
     if (g_wifi_available) log_msg("WiFi support detected (iwctl present).");
     // "/mnt/storage/" + local_default_dir - only if the config key is
