@@ -161,6 +161,12 @@ first and the image itself still streams (`bmap-writer -`). If the
 binary or the `.bmap` is missing, it logs that and uses `dd` as before;
 `wic_use_bmap = false` in `config.toml` forces `dd` regardless.
 
+Either way, the confirmation dialog compares the image size (file
+size, or the server's Content-Length for URLs) with the selected disk
+before anything is written, and keeps Install disabled if it does
+not fit. Without a Content-Length the dialog says so and the check
+only happens again in the worker, where it can't do better either.
+
 bmap-writer prints no progress of its own, so the bar is driven by
 the kernel's write counter for the target disk
 (`/sys/class/block/<dev>/stat`), which needs nothing from the kernel

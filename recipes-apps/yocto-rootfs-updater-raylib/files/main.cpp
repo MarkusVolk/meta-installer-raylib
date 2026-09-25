@@ -2010,6 +2010,51 @@ static void run_pending_wifi_scan() {
     }
 }
 
+static std::string g_confirm_size_note;
+static bool g_confirm_size_blocks = false;
+
+static void prepare_wic_confirm_size_check() {
+    g_confirm_size_note.clear();
+    g_confirm_size_blocks = false;
+    if (g_app.install_mode != 1) return;
+    std::string dev = g_app.disk_sel.get_device();
+    if (dev.empty()) return;
+
+    long long image = 0;
+    std::string image_note;
+    if (g_app.wic_source_kind == 0) {
+        struct stat st{};
+        if (stat(g_app.wic_local_path, &st) == 0) image = (long long)st.st_size;
+        else image_note = "Image file not found: " + std::string(g_app.wic_local_path);
+    } else {
+        std::string url = g_app.wic_source_kind == 1 ? g_app.wic_http_url : g_app.wic_url;
+        image = backend::get_content_length(url);
+        if (image <= 0) image_note = "Image size unknown (server sent no Content-Length) - cannot verify it fits before writing.";
+    }
+    long long disk = 0;
+    try {
+        disk = backend::block_device_size(dev);
+    } catch (const std::exception& e) {
+        g_confirm_size_note = std::string("Cannot determine disk size: ") + e.what();
+        log_msg("WARNING: " + g_confirm_size_note);
+        return;
+    }
+    if (image <= 0) {
+        g_confirm_size_note = image_note.empty() ? "Image size unknown." : image_note;
+        g_confirm_size_note += "\nDisk: " + backend::human_size((double)disk);
+        log_msg("WARNING: " + image_note);
+        return;
+    }
+    g_confirm_size_note = "Image: " + backend::human_size((double)image) +
+                          ", disk: " + backend::human_size((double)disk);
+    if (image > disk) {
+        g_confirm_size_blocks = true;
+        g_confirm_size_note = "ERROR: the image does not fit on the selected disk!\n" + g_confirm_size_note;
+        log_msg("ERROR: Image does not fit: " + backend::human_size((double)image) + " image, " +
+                backend::human_size((double)disk) + " disk (" + dev + ").");
+    }
+}
+
 // Starts resolving the next queued directory URL (fetches its
 // listing), or - once the queue is empty - proceeds to the normal
 // confirmation dialog. Called both to kick off the whole chain (after
@@ -2018,6 +2063,7 @@ static void run_pending_wifi_scan() {
 static void advance_dir_picker_queue() {
     if (g_pending_dir_resolutions.empty()) {
         g_dir_picker_active = false;
+        prepare_wic_confirm_size_check();
         g_app.show_confirm = true;
         return;
     }
@@ -3006,6 +3052,7 @@ static void draw_ui() {
                    "The entire disk, including its partition table, will be lost -\n"
                    "including /home and any other partitions on it.\n"
                    "This is not an update, but a fresh installation.";
+            if (!g_confirm_size_note.empty()) msg += "\n\n" + g_confirm_size_note;
         }
         int btn_active = -1;
         // Box height sized to the actual wrapped message content, not
@@ -3068,10 +3115,14 @@ static void draw_ui() {
         float btn_start_x = box.x + box.width / 2 - btn_pair_w / 2;
         Rectangle install_btn = {btn_start_x, box.y + box.height - mb_btn_h - 12 * g_ui_scale, mb_btn_w, mb_btn_h};
         Rectangle cancel_btn = {install_btn.x + mb_btn_w + mb_pad, install_btn.y, mb_btn_w, mb_btn_h};
-        if (focusable_button(210, install_btn, "Install")) btn_active = 1;
+        if (g_confirm_size_blocks) {
+            push_gui_disabled();
+            GuiButton(install_btn, "Install");
+            pop_gui_disabled();
+        } else if (focusable_button(210, install_btn, "Install")) btn_active = 1;
         if (focusable_button(211, cancel_btn, "Cancel")) btn_active = 2;
         if (btn_active == -1) {
-            if (IsKeyPressed(KEY_ENTER)) btn_active = 1;
+            if (IsKeyPressed(KEY_ENTER) && !g_confirm_size_blocks) btn_active = 1;
             else if (IsKeyPressed(KEY_ESCAPE)) btn_active = 2;
         }
         if (btn_active == 0 || btn_active == 2) {

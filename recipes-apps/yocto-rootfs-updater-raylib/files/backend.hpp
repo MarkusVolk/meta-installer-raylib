@@ -1053,7 +1053,11 @@ inline void write_disk_image(const std::string& source, bool is_url, const std::
     if (total > disk)
         throw OperationError("Image does not fit: " + human_size((double)total) + " image, " +
                              human_size((double)disk) + " disk (" + device + ").");
-    if (total <= 0) total = 1;
+    if (total <= 0) {
+        log("WARNING: image size unknown (no Content-Length) - cannot check that it fits on " + device +
+            " before writing; dd will fail at the end of the disk if it doesn't.");
+        total = 1;
+    }
 
     std::string ofArg = "of=" + device;
     pid_t curlPid = -1, ddPid;
