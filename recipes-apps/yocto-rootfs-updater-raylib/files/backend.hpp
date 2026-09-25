@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
 #include <linux/fs.h>
@@ -1370,6 +1371,53 @@ inline void set_fs_label(const std::string& device, const std::string& fstype,
     ProcResult r = exec_capture(cmd);
     if (r.exit_code == 0) log("Partition label set to \"" + applied + "\".");
     else log("Could not set the partition label (" + strip_ansi_codes(r.output) + ") - continuing.");
+}
+
+inline void set_boot_entry_title(const std::string& esp_mp, const std::string& kernel_name,
+                                  const std::string& title, const LogFn& log) {
+    if (title.empty() || kernel_name.empty()) return;
+    std::string dir = esp_mp + "/loader/entries";
+    DIR* d = opendir(dir.c_str());
+    if (!d) { log("No " + dir + " - boot menu title left as it was."); return; }
+    std::vector<std::string> confs;
+    while (struct dirent* e = readdir(d)) {
+        std::string n = e->d_name;
+        if (n.size() > 5 && n.compare(n.size() - 5, 5, ".conf") == 0) confs.push_back(dir + "/" + n);
+    }
+    closedir(d);
+    for (const auto& path : confs) {
+        std::ifstream in(path);
+        if (!in) continue;
+        std::vector<std::string> lines;
+        std::string line;
+        bool boots_kernel = false;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::istringstream ls(line);
+            std::string key, val;
+            ls >> key >> val;
+            if (key == "linux") {
+                size_t slash = val.find_last_of('/');
+                if ((slash == std::string::npos ? val : val.substr(slash + 1)) == kernel_name) boots_kernel = true;
+            }
+            lines.push_back(line);
+        }
+        in.close();
+        if (!boots_kernel) continue;
+        bool has_title = false;
+        for (auto& l : lines) {
+            if (l.compare(0, 6, "title ") == 0 || l.compare(0, 6, "title\t") == 0) {
+                l = "title " + title;
+                has_title = true;
+            }
+        }
+        if (!has_title) lines.insert(lines.begin(), "title " + title);
+        std::ofstream out(path, std::ios::trunc);
+        for (const auto& l : lines) out << l << "\n";
+        out.close();
+        if (out) log("Boot menu entry " + path + " titled \"" + title + "\".");
+        else log("Could not rewrite " + path + " - boot menu title left as it was.");
+    }
 }
 
 // Boot partition matching now happens in main.cpp via PKNAME (same

@@ -1679,6 +1679,7 @@ static void run_pipeline(AppState snapshot) {
             std::string dest = kernel_mp + "/" + target_name;
             log_msg("Copying kernel to " + dest + "...");
             backend::copy_file(kernel_path, dest);
+            backend::set_boot_entry_title(kernel_mp, target_name, installed_image_id, log_msg);
         }
 
         log_msg("Syncing write cache...");
