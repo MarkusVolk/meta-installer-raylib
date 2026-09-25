@@ -80,8 +80,10 @@ INITRAMFS_MAXSIZE = "524288"
 # own dd/tar-extract logic, same division of responsibility the disk-
 # backed image already has (see its own comments on why parted/sfdisk-
 # adjacent tooling is scoped to storage-partition-helper, not the app).
-IMAGE_INSTALL:append = " \
+IMAGE_INSTALL = " \
     packagegroup-core-boot \
+    packagegroup-machine-base \
+    ${CORE_IMAGE_EXTRA_INSTALL} \
     libdrm \
     bash \
     util-linux-lsblk \

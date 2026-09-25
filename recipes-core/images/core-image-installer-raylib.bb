@@ -11,8 +11,10 @@ inherit core-image
 # the unexpected "platform"/"swap" labels came from.
 WKS_FILE = "installer.wks.in"
 
-IMAGE_INSTALL:append = " \
+IMAGE_INSTALL = " \
     packagegroup-core-boot \
+    packagegroup-machine-base \
+    ${CORE_IMAGE_EXTRA_INSTALL} \
     libdrm \
     bash \
     util-linux-lsblk \
