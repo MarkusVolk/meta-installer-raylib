@@ -49,4 +49,4 @@ COMPATIBLE_MACHINE:genericx86-64 = "genericx86-64"
 KMACHINE:genericx86-64 ?= "intel-corei7-64"
 
 KBRANCH:genericarm64 ?= "v6.18/standard/genericarm64"
-SRCREV_machine:genericarm64 ?= "5b1e83ae84e1bbe2ab8197bf2ea3c24302f7d1e3"
+SRCREV_machine:genericarm64 ?= "07acbdc95f3e934116546b9a90b813d7b30397b7"
