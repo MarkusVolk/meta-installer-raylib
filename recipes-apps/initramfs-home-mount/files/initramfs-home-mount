@@ -147,7 +147,10 @@ OTHER_DISK_PARTS=""
 for CANDIDATE in $(list_partitions); do
     [ -b "$CANDIDATE" ] || continue
     CANDIDATE_LABEL=$(blkid -o value -s LABEL "$CANDIDATE" 2>/dev/null || true)
-    [ "$CANDIDATE_LABEL" = "$LABEL" ] || continue
+    case "$CANDIDATE_LABEL" in
+        "$LABEL"|"$LABEL"-*) ;;
+        *) continue ;;
+    esac
     CANDIDATE_DISK=$(lsblk -no PKNAME "$CANDIDATE" 2>/dev/null || true)
     if [ "$CANDIDATE_DISK" = "$BOOT_DISK_NAME" ]; then
         BOOT_DISK_PARTS="${BOOT_DISK_PARTS} ${CANDIDATE}"
@@ -172,7 +175,7 @@ for HOME_DEV in ${BOOT_DISK_PARTS} ${OTHER_DISK_PARTS}; do
     # minimal image has no kernel module for) must not cost the others
     # their mount - the whole point of looking at several disks.
     if mount -o ro "$HOME_DEV" "$TARGET"; then
-        echo "Mounted $HOME_DEV (label \"$LABEL\") at $TARGET."
+        echo "Mounted $HOME_DEV at $TARGET."
     else
         echo "W: could not mount $HOME_DEV at $TARGET - skipping it."
         rmdir "$TARGET" 2>/dev/null || true
