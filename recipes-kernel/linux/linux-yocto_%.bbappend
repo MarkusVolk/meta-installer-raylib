@@ -5,6 +5,7 @@ SRC_URI:append = " \
     file://input-hid-enable.cfg \
     file://disable-unused-subsystems.cfg \
     file://exfat-enable.cfg \
+    file://squashfs-boot.cfg \
     ${@bb.utils.contains('DISTRO_FEATURES', 'wifi', 'file://wifi-enable.cfg', '', d)} \
 "
 

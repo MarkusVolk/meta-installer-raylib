@@ -193,8 +193,8 @@ sets `INCOMPATIBLE_LICENSE`.
   a pure initramfs, no disk-backed rootfs partition of its own at
   all. Primarily intended to be **embedded onto an existing, real
   machine's own boot disk** as an extra `systemd-boot` menu entry
-  (see `scripts/add-initramfs-installer-boot-entry.sh` /
-  `embed-initramfs-installer-live.sh` below) — a rescue/recovery
+  (see `scripts/add-initramfs-installer-boot-entry.sh` below and
+  meta-image's `scripts/embed-squashfs-boot.sh`) — a rescue/recovery
   option that's always there, without a USB stick to keep track of.
   Standalone USB booting also works (`build-initramfs-installer-
   image.sh`). On boot it mounts every partition labeled `home` it
@@ -267,22 +267,23 @@ most run on the build machine, one runs directly on a deployed target
 
 - **`build-payload-image.sh`** — bundles a payload onto the
   disk-backed installer image, see above.
-- **`add-initramfs-installer-boot-entry.sh`** — embeds the initramfs
-  installer onto an existing desktop image's own disk as an extra
-  `systemd-boot` menu entry - just two extra files (kernel +
-  initramfs) and a loader entry, no partition work at all.
-- **`build-initramfs-installer-image.sh`** — builds a standalone,
-  ESP-only bootable image for the initramfs installer.
-- **`embed-initramfs-installer-live.sh`** — same idea as
-  `add-initramfs-installer-boot-entry.sh`, but **run directly on an
-  already-deployed, already-running target itself** (as root)
-  instead of a build artifact.
+- **`add-initramfs-installer-boot-entry.sh`** — embeds the RAM-resident
+  installer into an existing desktop `.wic` as an extra `systemd-boot`
+  menu entry: kernel and the small squashfs-boot initramfs on the ESP,
+  the installer squashfs on the `images` partition.
+- **`build-initramfs-installer-image.sh`** — builds a standalone
+  bootable image for the RAM-resident installer: an ESP and an
+  `images` partition.
+
+On an already-running system the installer is added with meta-image's
+`scripts/embed-squashfs-boot.sh -p core-image-installer-raylib-initramfs
+-n installer -t Installer -r /boot`.
 - **`serve-https.py`** — a small local HTTP/HTTPS server for testing
   the app's own URL-based download options without a real server.
 
-The three initramfs scripts auto-detect kernel and initramfs from
-`tmp/deploy/images/*/` relative to the current directory when `-k`/`-i`
-are not given. With more than one machine directory present (e.g.
+The two installer scripts auto-detect kernel, initramfs and squashfs
+from `tmp/deploy/images/*/` relative to the current directory when
+`-k`/`-i`/`-s` are not given. With more than one machine directory present (e.g.
 after switching `MACHINE` in `local.conf`, the old one's artifacts
 still around) the **newest** match by mtime wins; export `MACHINE` to
 pin a specific one. The scripts print what they picked - check that

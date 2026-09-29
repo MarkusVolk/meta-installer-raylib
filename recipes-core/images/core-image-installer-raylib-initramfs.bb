@@ -59,7 +59,9 @@ LICENSE = "BSD-2-Clause"
 inherit core-image
 
 # The whole point of this variant - see the comments above.
-IMAGE_FSTYPES = "${INITRAMFS_FSTYPES}"
+IMAGE_FSTYPES = "squashfs-zst"
+
+do_build[depends] += "squashfs-boot-initramfs:do_image_complete virtual/kernel:do_deploy"
 
 # oe-core's own default INITRAMFS_MAXSIZE (128M) is a safety check -
 # the guidance is "should be less than 1/2 of RAM size", not a hard

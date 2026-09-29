@@ -1,18 +1,16 @@
 #!/bin/sh
-# Embeds the initramfs-based installer (core-image-installer-raylib-
-# initramfs.bb) into an EXISTING desktop image's own ESP - kernel +
-# initramfs cpio.gz copied in as two extra files, plus a new
-# systemd-boot loader entry (no "root=", nothing to mount).
-#
-# No partition table work at all - just two extra files and a loader
-# entry on the existing ESP.
+# Embeds the RAM-resident installer (core-image-installer-raylib-
+# initramfs.bb) into an EXISTING desktop .wic: kernel and the small
+# squashfs-boot initramfs go to installer/ on its ESP, the installer
+# squashfs to installer/ on its images partition, plus a systemd-boot
+# entry that boots it with squashfs.toram. No partition table work.
 set -eu
 
 usage() {
-    echo "Usage: $0 [-k kernel] [-i initramfs.cpio.gz] [-o output.img]" >&2
+    echo "Usage: $0 [-k kernel] [-i squashfs-boot-initramfs.cpio.gz] [-s installer.squashfs] [-o output.img]" >&2
     echo "  -k/-i/-o: auto-detected/derived if not given (see below). No" >&2
     echo "  positional arguments accepted." >&2
-    echo "  -k/-i: auto-detected from tmp/deploy/images/*/ (relative to cwd) if not given." >&2
+    echo "  -k/-i/-s: auto-detected from tmp/deploy/images/*/ (relative to cwd) if not given." >&2
     echo "  desktop.wic: always auto-discovered from payload_source_dir (env or" >&2
     echo "  ~/.config/build-payload-image.conf) - no explicit override for it at" >&2
     echo "  all." >&2
@@ -22,18 +20,20 @@ usage() {
 
 KERNEL_ARG=""
 INITRAMFS_ARG=""
+SQUASHFS_ARG=""
 OUTPUT_ARG=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -k) KERNEL_ARG="$2"; shift 2 ;;
         -i) INITRAMFS_ARG="$2"; shift 2 ;;
+        -s) SQUASHFS_ARG="$2"; shift 2 ;;
         -o) OUTPUT_ARG="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "E: Unknown/unexpected argument: $1 (only -k/-i/-o flags are accepted, no positional arguments)" >&2; usage ;;
     esac
 done
 
-for tool in sfdisk partx mkfs.vfat losetup truncate mcopy mmd setsid blkid findmnt; do
+for tool in sfdisk partx mkfs.vfat losetup truncate mcopy mmd setsid blkid findmnt debugfs; do
     command -v "$tool" >/dev/null 2>&1 || { echo "E: required tool not found: $tool" >&2; exit 1; }
 done
 
@@ -85,10 +85,16 @@ if [ -z "$KERNEL_ARG" ]; then
     echo "Auto-detected kernel: $KERNEL_ARG"
 fi
 if [ -z "$INITRAMFS_ARG" ]; then
-    INITRAMFS_ARG=$(resolve_deploy_input "*installer-raylib-initramfs-*.rootfs.cpio.gz")
+    INITRAMFS_ARG=$(resolve_deploy_input "squashfs-boot-initramfs-*.cpio.gz")
     [ -n "$INITRAMFS_ARG" ] || { echo "E: No initramfs given and none auto-detected." >&2; exit 1; }
     echo "Auto-detected initramfs: $INITRAMFS_ARG"
 fi
+if [ -z "$SQUASHFS_ARG" ]; then
+    SQUASHFS_ARG=$(resolve_deploy_input "*installer-raylib-initramfs-*.rootfs.squashfs-zst")
+    [ -n "$SQUASHFS_ARG" ] || { echo "E: No squashfs given and none auto-detected." >&2; exit 1; }
+    echo "Auto-detected squashfs: $SQUASHFS_ARG"
+fi
+[ -f "$SQUASHFS_ARG" ] || { echo "E: Squashfs not found: $SQUASHFS_ARG" >&2; exit 1; }
 [ -f "$KERNEL_ARG" ] || { echo "E: Kernel not found: $KERNEL_ARG" >&2; exit 1; }
 [ -f "$INITRAMFS_ARG" ] || { echo "E: Initramfs not found: $INITRAMFS_ARG" >&2; exit 1; }
 
@@ -148,9 +154,20 @@ done
 [ -n "$DESKTOP_ESP_PART" ] || { echo "E: Could not find the desktop image's ESP (FAT partition)." >&2; exit 1; }
 echo "Desktop ESP: ${DESKTOP_ESP_PART}"
 
-# Distinct names so they can't collide with the desktop's own kernel.
-setsid mcopy -D o -i "$DESKTOP_ESP_PART" "$KERNEL_ARG" ::/installer-initramfs-bzImage < /dev/null
-setsid mcopy -D o -i "$DESKTOP_ESP_PART" "$INITRAMFS_ARG" ::/installer-initramfs.cpio.gz < /dev/null
+IMAGES_PART=""
+for p in "${DESKTOP_LOOP}"p*; do
+    [ -b "$p" ] || continue
+    [ "$(blkid -o value -s LABEL "$p" 2>/dev/null || true)" = "images" ] && IMAGES_PART="$p" && break
+done
+[ -n "$IMAGES_PART" ] || { echo "E: The desktop image has no partition labeled images." >&2; exit 1; }
+IMAGES_PARTUUID=$(blkid -p -o value -s PART_ENTRY_UUID "$IMAGES_PART" | tr 'A-F' 'a-f')
+echo "Images partition: ${IMAGES_PART} (PARTUUID ${IMAGES_PARTUUID})"
+printf 'mkdir installer\nrm installer/installer.squashfs\nwrite %s installer/installer.squashfs\n' "$SQUASHFS_ARG" | \
+    debugfs -w -f - "$IMAGES_PART" >/dev/null
+
+setsid mmd -D o -i "$DESKTOP_ESP_PART" ::/installer < /dev/null 2>/dev/null || true
+setsid mcopy -D o -i "$DESKTOP_ESP_PART" "$KERNEL_ARG" ::/installer/kernel < /dev/null
+setsid mcopy -D o -i "$DESKTOP_ESP_PART" "$INITRAMFS_ARG" ::/installer/initramfs < /dev/null
 
 setsid mdir -i "$DESKTOP_ESP_PART" ::/loader/entries < /dev/null >/dev/null 2>&1 || setsid mmd -i "$DESKTOP_ESP_PART" ::/loader/entries < /dev/null 2>/dev/null || true
 
@@ -158,9 +175,9 @@ setsid mdir -i "$DESKTOP_ESP_PART" ::/loader/entries < /dev/null >/dev/null 2>&1
 cat > /tmp/.initramfs-entry.conf.$$ << EOF
 title Installer (RAM-resident)
 version installer-initramfs
-linux /installer-initramfs-bzImage
-initrd /installer-initramfs.cpio.gz
-options console=ttyS0,115200 console=tty0
+linux /installer/kernel
+initrd /installer/initramfs
+options squashfs=PARTUUID=${IMAGES_PARTUUID}:/installer/installer.squashfs squashfs.toram console=ttyS0,115200 console=tty0
 sort-key 9-installer
 EOF
 setsid mcopy -D o -i "$DESKTOP_ESP_PART" /tmp/.initramfs-entry.conf.$$ ::/loader/entries/initramfs-installer.conf < /dev/null
