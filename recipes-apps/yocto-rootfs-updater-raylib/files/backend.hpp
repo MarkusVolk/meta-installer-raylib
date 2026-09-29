@@ -1256,6 +1256,10 @@ inline BmapInfo parse_bmap_file(const std::string& path) {
     std::ifstream f(path);
     if (!f) throw OperationError("Cannot read bmap file: " + path);
     std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    for (size_t c; (c = content.find("<!--")) != std::string::npos;) {
+        size_t e = content.find("-->", c);
+        content.erase(c, e == std::string::npos ? std::string::npos : e + 3 - c);
+    }
     auto tag_value = [&](const char* tag) -> long long {
         std::string open = std::string("<") + tag + ">";
         std::string close = std::string("</") + tag + ">";
