@@ -277,7 +277,7 @@ most run on the build machine, one runs directly on a deployed target
 
 On an already-running system the installer is added with meta-image's
 `scripts/embed-squashfs-boot.sh -p core-image-installer-raylib-initramfs
--n installer -t Installer -r /boot`.
+-n installer -t Installer -S 9-installer -r /boot`.
 - **`serve-https.py`** — a small local HTTP/HTTPS server for testing
   the app's own URL-based download options without a real server.
 
