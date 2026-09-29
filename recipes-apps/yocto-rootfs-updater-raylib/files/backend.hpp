@@ -508,6 +508,58 @@ inline void do_unmount(const std::string& mountpoint, const LogFn& log) {
     }
 }
 
+inline const char* kRamStageDir = "/run/wic-in-ram";
+
+inline bool path_on_disk(const std::string& path, const std::string& device, const LogFn& log) {
+    return disk_containing_path(path, list_partitions(log)) == device.substr(device.rfind('/') + 1);
+}
+
+inline long long mem_available_bytes() {
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    long long kb = 0;
+    while (f >> key >> kb) {
+        if (key == "MemAvailable:") return kb * 1024;
+        f.ignore(256, '\n');
+    }
+    return 0;
+}
+
+inline std::vector<std::string> stage_in_ram(const std::vector<std::string>& files, const LogFn& log) {
+    long long needed = 64LL << 20;
+    for (auto& f : files) {
+        struct stat st{};
+        if (stat(f.c_str(), &st) == 0) needed += (long long)st.st_blocks * 512;
+    }
+    long long avail = mem_available_bytes();
+    if (needed > avail)
+        throw OperationError("The image is on the disk it would overwrite. Copying it into RAM needs " +
+                             human_size((double)needed) + ", only " + human_size((double)avail) + " are available.");
+    mkdir(kRamStageDir, 0700);
+    if (!is_mounted_at(kRamStageDir))
+        run_checked({"mount", "-t", "tmpfs", "-o", "mode=0700,size=" + std::to_string(needed), "tmpfs", kRamStageDir}, log);
+    std::vector<std::string> out;
+    for (auto& f : files) {
+        std::string dst = std::string(kRamStageDir) + "/" + f.substr(f.rfind('/') + 1);
+        log("Copying " + f + " into RAM...");
+        run_checked({"cp", "--sparse=always", f, dst}, log);
+        out.push_back(dst);
+    }
+    return out;
+}
+
+inline void release_disk(const std::string& device, const std::string& source_path, const LogFn& log) {
+    std::string disk = device.substr(device.rfind('/') + 1);
+    auto parts = list_partitions(log);
+    if (!source_path.empty() && disk_containing_path(source_path, parts) == disk)
+        throw OperationError("The image " + source_path + " is on " + device + ", the disk it would overwrite.");
+    for (auto& p : parts) {
+        if (p.pkname != disk || p.mountpoint.empty()) continue;
+        log("Unmounting " + p.path + " from " + p.mountpoint + "...");
+        run_checked({"umount", p.mountpoint}, log);
+    }
+}
+
 #include <dirent.h>
 
 inline void remove_recursive(const std::string& path) {

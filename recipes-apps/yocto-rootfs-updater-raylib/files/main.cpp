@@ -27,6 +27,7 @@ extern "C" {
 #include <string>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
 #include <thread>
 #include <vector>
 
@@ -1818,6 +1819,14 @@ static void run_wic_pipeline(AppState snapshot) {
             log_msg("bmap-writer not installed - writing with dd.");
         }
 
+        if (!is_url && backend::path_on_disk(source, device, log_msg)) {
+            std::vector<std::string> files{source};
+            if (!bmap_path.empty()) files.push_back(bmap_path);
+            auto staged = backend::stage_in_ram(files, log_msg);
+            source = staged[0];
+            if (!bmap_path.empty()) bmap_path = staged[1];
+        }
+        backend::release_disk(device, is_url ? std::string() : source, log_msg);
         log_msg("Writing wic image to " + device + " ...");
         set_progress(0, 1, "Starting...");
         if (!bmap_path.empty()) {
@@ -1838,6 +1847,7 @@ static void run_wic_pipeline(AppState snapshot) {
 
     if (!tmp_wic_download.empty()) unlink(tmp_wic_download.c_str());
     if (!tmp_bmap_download.empty()) unlink(tmp_bmap_download.c_str());
+    if (backend::is_mounted_at(backend::kRamStageDir)) umount2(backend::kRamStageDir, MNT_DETACH);
 }
 
 // ---------------------------------------------------------------------
@@ -2349,28 +2359,13 @@ static void draw_ui() {
                     safe_to_proceed = false;
                 }
 
-                // Safety check specific to wic-install with a local file
-                // source: dd reads the source sequentially while writing
-                // the target sequentially - if source and target
-                // physically overlap (the local .wic file sits on the
-                // very disk about to be wiped, e.g. via /mnt/storage in
-                // the embedded installer pointing at the desktop's own
-                // disk), the write would progressively overwrite parts of
-                // the source file it hasn't read yet, corrupting the copy
-                // mid-operation. Found via user question before it could
-                // bite in practice.
                 if (safe_to_proceed && g_app.wic_source_kind == 0) {
                     std::string source_disk = backend::disk_containing_path(g_app.wic_local_path, partitions);
-                    // target_disk is a full path like /dev/sda; source_disk
-                    // (from PKNAME) is a bare name like "sda" - compare by
-                    // suffix rather than requiring an exact match.
                     if (!source_disk.empty() && !target_disk.empty() &&
                         target_disk.size() >= source_disk.size() &&
                         target_disk.compare(target_disk.size() - source_disk.size(), source_disk.size(), source_disk) == 0) {
-                        log_msg("ERROR: The selected local .wic file is on the same disk (" + source_disk +
-                                ") as the selected target - writing would overwrite the source file while still "
-                                "reading it. Choose a different target disk, or move/copy the source file elsewhere first.");
-                        safe_to_proceed = false;
+                        log_msg("The selected .wic file is on the target disk (" + source_disk +
+                                ") - it will be copied into RAM before writing.");
                     }
                 }
             }
