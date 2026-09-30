@@ -13,7 +13,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # recommended range (10-40) for vendor/package-supplied drop-ins
 # specifically (as opposed to the 60-90 range reserved for local
 # administrator overrides under /etc/).
-SRC_URI += "file://10-storage-volatile.conf file://10-dnssec.conf"
+SRC_URI += "file://10-storage-volatile.conf file://10-dnssec.conf file://10-not-required-for-online.conf"
 
 do_install:append() {
     install -Dm 0644 ${UNPACKDIR}/10-storage-volatile.conf ${D}${systemd_unitdir}/journald.conf.d/10-storage-volatile.conf
@@ -21,6 +21,7 @@ do_install:append() {
     # DNSSEC validation then rejects the answers as expired - including the
     # NTP server names, so timesyncd never corrects the clock.
     install -Dm 0644 ${UNPACKDIR}/10-dnssec.conf ${D}${systemd_unitdir}/resolved.conf.d/10-dnssec.conf
+    install -Dm 0644 ${UNPACKDIR}/10-not-required-for-online.conf ${D}${systemd_unitdir}/network/80-wired.network.d/10-not-required-for-online.conf
 }
 
-FILES:${PN} += "${systemd_unitdir}/journald.conf.d/10-storage-volatile.conf ${systemd_unitdir}/resolved.conf.d/10-dnssec.conf"
+FILES:${PN} += "${systemd_unitdir}/journald.conf.d/10-storage-volatile.conf ${systemd_unitdir}/resolved.conf.d/10-dnssec.conf ${systemd_unitdir}/network/80-wired.network.d/10-not-required-for-online.conf"
