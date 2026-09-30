@@ -1,0 +1,633 @@
+From 7daf5578260e6c6270d447ec9edb3a1bb001edf4 Mon Sep 17 00:00:00 2001
+From: Markus Volk <f_l_k@t-online.de>
+Date: Wed, 30 Sep 2026 21:51:30 +0200
+Subject: [PATCH] DRM: software rendering: keep the kernel's mode, flip
+ persistent buffers
+
+With GRAPHICS_API_OPENGL_SOFTWARE the first mode of the connector was
+used, whatever size the application asked for. On a TV listing eight
+1920x1080 modes, booted with video=1920x1080@60, this picked a mode with
+other timings than the one the kernel had set, and the TV showed the
+picture shifted, a part of the left edge at the right.
+
+Select the mode like the hardware path does, and prefer the mode the
+CRTC shows already when it has the requested size and refresh rate. The
+comparison is done on the timings, as FindMatchingConnectorMode() only
+compares the first bytes of the modes.
+
+Every frame also created a new dumb buffer, which the kernel clears,
+and did a full mode set with it. Create two dumb buffers once, keep them
+mapped and show each frame with a page flip.
+
+Upstream-Status: Pending
+---
+ src/platforms/rcore_drm.c | 482 ++++++++++++++++++++++++--------------
+ 1 file changed, 300 insertions(+), 182 deletions(-)
+
+diff --git a/src/platforms/rcore_drm.c b/src/platforms/rcore_drm.c
+index ab58108dd..c2ece8562 100644
+--- a/src/platforms/rcore_drm.c
++++ b/src/platforms/rcore_drm.c
+@@ -72,6 +72,9 @@
+ #else
+     #include <sys/mman.h>       // For mmap when copying to the dumb buffer
+     #include <errno.h>          // For the conversion of certain error messages
++    #include <poll.h>           // Required for: waiting for the page flip event
++
++    #define DRM_SW_BUFFERS  2   // Dumb buffers for software rendering: one scanned out, one drawn into
+ #endif
+ 
+ // NOTE: DRM cache enables triple buffered DRM caching
+@@ -103,6 +106,15 @@
+ //----------------------------------------------------------------------------------
+ // Types and Structures Definition
+ //----------------------------------------------------------------------------------
++#if defined(GRAPHICS_API_OPENGL_SOFTWARE)
++typedef struct {
++    uint32_t handle;                    // Dumb buffer handle
++    uint32_t fb;                        // DRM framebuffer on top of the dumb buffer
++    uint64_t size;                      // Size of the mapping
++    void *map;                          // Dumb buffer mapped into userspace
++} DumbBuffer;
++#endif
++
+ typedef struct {
+     // Display data
+     int fd;                             // File descriptor for /dev/dri/...
+@@ -120,7 +132,10 @@ typedef struct {
+     EGLContext context;                 // Graphic context, mode in which drawing can be done
+     EGLConfig config;                   // Graphic config
+ #else
+-    uint32_t prevDumbHandle;            // Handle to the previous dumb buffer (during frame swapping)
++    DumbBuffer dumb[DRM_SW_BUFFERS];    // Dumb buffers, created once on the first swap
++    int dumbBack;                       // Index of the dumb buffer to draw the next frame into
++    bool dumbReady;                     // Dumb buffers are created and the CRTC is set
++    bool dumbFlipPending;               // A page flip is queued and not completed yet
+ #endif
+ 
+     // Keyboard data
+@@ -342,6 +357,7 @@ static void PollGamepadEvents(void);            // Process evdev gamepad events
+ static void PollMouseEvents(void);              // Process evdev mouse events
+ 
+ static int FindMatchingConnectorMode(const drmModeConnector *connector, const drmModeModeInfo *mode);                               // Search matching DRM mode in connector's mode list
++static int SelectConnectorMode(void);                                                                                               // Select the connector mode for the requested screen size
+ static int FindExactConnectorMode(const drmModeConnector *connector, uint width, uint height, uint fps, bool allowInterlaced);      // Search exactly matching DRM connector mode in connector's list
+ static int FindNearestConnectorMode(const drmModeConnector *connector, uint width, uint height, uint fps, bool allowInterlaced);    // Search the nearest matching DRM connector mode in connector's list
+ 
+@@ -868,6 +884,161 @@ void SwapScreenBuffer()
+ 
+ #else // !SUPPORT_DRM_CACHE
+ 
++#if defined(GRAPHICS_API_OPENGL_SOFTWARE)
++// Create a dumb buffer with a framebuffer on top and map it into userspace
++static int CreateDumbBuffer(DumbBuffer *buffer, uint32_t width, uint32_t height)
++{
++    struct drm_mode_create_dumb creq = { 0 };
++    creq.width = width;
++    creq.height = height;
++    creq.bpp = 32;      // 32 bits per pixel (XRGB8888 format)
++
++    if (drmIoctl(platform.fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0)
++    {
++        TRACELOG(LOG_ERROR, "DISPLAY: Failed to create dumb buffer: %s", strerror(errno));
++        return -1;
++    }
++
++    buffer->handle = creq.handle;
++    buffer->size = creq.size;
++
++    // NOTE: The blit writes rows without padding
++    if (creq.pitch != width*4) TRACELOG(LOG_WARNING, "DISPLAY: Dumb buffer pitch %u differs from the row size %u", creq.pitch, width*4);
++
++    // Color depth 24 bits, alpha is not used
++    if (drmModeAddFB(platform.fd, width, height, 24, 32, creq.pitch, creq.handle, &buffer->fb) != 0)
++    {
++        TRACELOG(LOG_ERROR, "DISPLAY: drmModeAddFB() failed: %s", strerror(errno));
++        return -1;
++    }
++
++    struct drm_mode_map_dumb mreq = { 0 };
++    mreq.handle = creq.handle;
++    if (drmIoctl(platform.fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) != 0)
++    {
++        TRACELOG(LOG_ERROR, "DISPLAY: Failed to map dumb buffer: %s", strerror(errno));
++        return -1;
++    }
++
++    void *map = mmap(0, creq.size, PROT_READ | PROT_WRITE, MAP_SHARED, platform.fd, mreq.offset);
++    if (map == MAP_FAILED)
++    {
++        TRACELOG(LOG_ERROR, "DISPLAY: Failed to mmap dumb buffer: %s", strerror(errno));
++        return -1;
++    }
++
++    buffer->map = map;
++
++    return 0;
++}
++
++// Unmap and free the dumb buffers and their framebuffers
++static void DestroyDumbBuffers(void)
++{
++    for (int i = 0; i < DRM_SW_BUFFERS; i++)
++    {
++        DumbBuffer *buffer = &platform.dumb[i];
++
++        if (buffer->map) munmap(buffer->map, buffer->size);
++        if (buffer->fb) drmModeRmFB(platform.fd, buffer->fb);
++        if (buffer->handle)
++        {
++            struct drm_mode_destroy_dumb dreq = { 0 };
++            dreq.handle = buffer->handle;
++            drmIoctl(platform.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
++        }
++
++        memset(buffer, 0, sizeof(*buffer));
++    }
++
++    platform.dumbReady = false;
++    platform.dumbFlipPending = false;
++}
++
++static void SoftwarePageFlipHandler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data)
++{
++    (void)fd;
++    (void)frame;
++    (void)sec;
++    (void)usec;
++    (void)data;
++
++    platform.dumbFlipPending = false;
++}
++
++// Wait for the queued page flip, at most a few frames
++static void WaitSoftwarePageFlip(void)
++{
++    drmEventContext evctx = { 0 };
++    evctx.version = 2;
++    evctx.page_flip_handler = SoftwarePageFlipHandler;
++
++    struct pollfd pfd = { .fd = platform.fd, .events = POLLIN };
++
++    while (platform.dumbFlipPending)
++    {
++        int result = poll(&pfd, 1, 100);
++
++        if ((result < 0) && (errno == EINTR)) continue;
++        if (result <= 0)
++        {
++            // Nothing arrived, do not block the application forever
++            TRACELOG(LOG_WARNING, "DISPLAY: Page flip did not complete");
++            platform.dumbFlipPending = false;
++            break;
++        }
++
++        drmHandleEvent(platform.fd, &evctx);
++    }
++}
++
++// Get the CRTC to use for software rendering, the connector may have no encoder
++static uint32_t FindSoftwareCrtc(void)
++{
++    if (platform.crtc) return platform.crtc->crtc_id;
++
++    drmModeRes *res = drmModeGetResources(platform.fd);
++    if (!res)
++    {
++        TRACELOG(LOG_ERROR, "DISPLAY: Failed to get DRM resources");
++        return 0;
++    }
++
++    uint32_t crtcId = 0;
++
++    // Check which CRTCs are compatible with this connector
++    drmModeEncoder *encoder = NULL;
++    if (platform.connector->encoder_id) encoder = drmModeGetEncoder(platform.fd, platform.connector->encoder_id);
++
++    if (encoder && encoder->crtc_id)
++    {
++        crtcId = encoder->crtc_id;
++        platform.crtc = drmModeGetCrtc(platform.fd, crtcId);
++    }
++    else
++    {
++        // Find a free CRTC
++        for (int i = 0; i < res->count_crtcs; i++)
++        {
++            drmModeCrtc *crtc = drmModeGetCrtc(platform.fd, res->crtcs[i]);
++            if (crtc && !crtc->buffer_id) // CRTC is free
++            {
++                crtcId = res->crtcs[i];
++                platform.crtc = crtc;
++                break;
++            }
++
++            if (crtc) drmModeFreeCrtc(crtc);
++        }
++    }
++
++    if (encoder) drmModeFreeEncoder(encoder);
++    drmModeFreeResources(res);
++
++    return crtcId;
++}
++#endif
++
+ // Swap back buffer with front buffer (screen drawing)
+ void SwapScreenBuffer(void)
+ {
+@@ -900,170 +1071,70 @@ void SwapScreenBuffer(void)
+     platform.prevBO = bo;
+ #else
+     // Software rendering buffer swap
++    // NOTE: Two dumb buffers are created and mapped once, the CRTC is set once with the first one,
++    // afterwards every frame is copied into the buffer not scanned out and shown with a page flip.
++    // Creating a dumb buffer (the kernel clears it) and a full mode set for every frame is very
++    // slow on small devices and a mode set each frame can also disturb the display
+     if ((platform.fd == -1) || !platform.connector || (platform.modeIndex < 0))
+     {
+         TRACELOG(LOG_ERROR, "DISPLAY: DRM initialization failed to swap");
+         return;
+     }
+ 
+-    // Retrieving the dimensions of the display mode used
+     drmModeModeInfo *mode = &platform.connector->modes[platform.modeIndex];
+     uint32_t width = mode->hdisplay;
+     uint32_t height = mode->vdisplay;
+ 
+-    // Dumb buffers use a fixed format based on bpp
+-    const uint32_t bpp = 32;    // 32 bits per pixel (XRGB8888 format)
+-    const uint32_t depth = 24;  // Color depth, here only 24 bits, alpha is not used
+-
+-    // Create a dumb buffer for software rendering
+-    struct drm_mode_create_dumb creq = { 0 };
+-    creq.width = width;
+-    creq.height = height;
+-    creq.bpp = bpp;
+-
+-    int result = drmIoctl(platform.fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
+-    if (result < 0)
+-    {
+-        TRACELOG(LOG_ERROR, "DISPLAY: Failed to create dumb buffer: %s", strerror(errno));
+-        return;
+-    }
+-
+-    // Create framebuffer with the correct format
+-    uint32_t fb = 0;
+-    result = drmModeAddFB(platform.fd, width, height, depth, bpp, creq.pitch, creq.handle, &fb);
+-    if (result != 0)
+-    {
+-        TRACELOG(LOG_ERROR, "DISPLAY: drmModeAddFB() failed with result: %d (%s)", result, strerror(errno));
+-        struct drm_mode_destroy_dumb dreq = { 0 };
+-        dreq.handle = creq.handle;
+-        drmIoctl(platform.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+-        return;
+-    }
+-
+-    // Map the dumb buffer to copy our software rendered buffer
+-    struct drm_mode_map_dumb mreq = { 0 };
+-    mreq.handle = creq.handle;
+-    result = drmIoctl(platform.fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq);
+-    if (result != 0)
+-    {
+-        TRACELOG(LOG_ERROR, "DISPLAY: Failed to map dumb buffer: %s", strerror(errno));
+-        drmModeRmFB(platform.fd, fb);
+-        struct drm_mode_destroy_dumb dreq = { 0 };
+-        dreq.handle = creq.handle;
+-        drmIoctl(platform.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+-        return;
+-    }
+-
+-    // Map the buffer into userspace
+-    void *dumbBuffer = mmap(0, creq.size, PROT_READ | PROT_WRITE, MAP_SHARED, platform.fd, mreq.offset);
+-    if (dumbBuffer == MAP_FAILED)
++    if (!platform.dumbReady)
+     {
+-        TRACELOG(LOG_ERROR, "DISPLAY: Failed to mmap dumb buffer: %s", strerror(errno));
+-        drmModeRmFB(platform.fd, fb);
+-        struct drm_mode_destroy_dumb dreq = { 0 };
+-        dreq.handle = creq.handle;
+-        drmIoctl(platform.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+-        return;
+-    }
+-
+-    // Copy the software rendered buffer to the dumb buffer with scaling if needed
+-    // NOTE: RLSW will make a simple copy if the dimensions match
+-    swBlitPixels(0, 0, width, height, 0, 0, width, height, SW_RGBA, SW_UNSIGNED_BYTE, dumbBuffer);
+-
+-    // Unmap the buffer
+-    munmap(dumbBuffer, creq.size);
+-
+-    // Find a CRTC compatible with the connector
+-    uint32_t crtcId = 0;
+-    if (platform.crtc) crtcId = platform.crtc->crtc_id;
+-    else
+-    {
+-        // Find a CRTC that's compatible with this connector
+-        drmModeRes *res = drmModeGetResources(platform.fd);
+-        if (!res)
++        uint32_t crtcId = FindSoftwareCrtc();
++        if (!crtcId)
+         {
+-            TRACELOG(LOG_ERROR, "DISPLAY: Failed to get DRM resources");
+-            drmModeRmFB(platform.fd, fb);
+-            struct drm_mode_destroy_dumb dreq = { 0 };
+-            dreq.handle = creq.handle;
+-            drmIoctl(platform.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
++            TRACELOG(LOG_ERROR, "DISPLAY: No compatible CRTC found");
+             return;
+         }
+ 
+-        // Check which CRTCs are compatible with this connector
+-        drmModeEncoder *encoder = NULL;
+-        if (platform.connector->encoder_id) encoder = drmModeGetEncoder(platform.fd, platform.connector->encoder_id);
+-
+-        if (encoder && encoder->crtc_id)
++        for (int i = 0; i < DRM_SW_BUFFERS; i++)
+         {
+-            crtcId = encoder->crtc_id;
+-            platform.crtc = drmModeGetCrtc(platform.fd, crtcId);
+-        }
+-        else
+-        {
+-            // Find a free CRTC
+-            for (int i = 0; i < res->count_crtcs; i++)
++            if (CreateDumbBuffer(&platform.dumb[i], width, height) != 0)
+             {
+-                drmModeCrtc *crtc = drmModeGetCrtc(platform.fd, res->crtcs[i]);
+-                if (crtc && !crtc->buffer_id) // CRTC is free
+-                {
+-                    crtcId = res->crtcs[i];
+-                    if (platform.crtc) drmModeFreeCrtc(platform.crtc);
+-                    platform.crtc = crtc;
+-                    break;
+-                }
+-
+-                if (crtc) drmModeFreeCrtc(crtc);
++                DestroyDumbBuffers();
++                return;
+             }
+         }
+ 
+-        if (encoder) drmModeFreeEncoder(encoder);
+-        drmModeFreeResources(res);
++        swBlitPixels(0, 0, width, height, 0, 0, width, height, SW_RGBA, SW_UNSIGNED_BYTE, platform.dumb[0].map);
+ 
+-        if (!crtcId)
++        if (drmModeSetCrtc(platform.fd, crtcId, platform.dumb[0].fb, 0, 0, &platform.connector->connector_id, 1, mode) != 0)
+         {
+-            TRACELOG(LOG_ERROR, "DISPLAY: No compatible CRTC found");
+-            drmModeRmFB(platform.fd, fb);
+-            struct drm_mode_destroy_dumb dreq = { 0 };
+-            dreq.handle = creq.handle;
+-            drmIoctl(platform.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
++            TRACELOG(LOG_ERROR, "DISPLAY: drmModeSetCrtc() failed: %s", strerror(errno));
++            TRACELOG(LOG_ERROR, "DISPLAY: CRTC ID: %u, FB ID: %u, Connector ID: %u", crtcId, platform.dumb[0].fb, platform.connector->connector_id);
++            TRACELOG(LOG_ERROR, "DISPLAY: Mode: %dx%d@%d", mode->hdisplay, mode->vdisplay, mode->vrefresh);
++            DestroyDumbBuffers();
+             return;
+         }
+-    }
+-
+-    // Set CRTC with better error handling
+-    result = drmModeSetCrtc(platform.fd, crtcId, fb, 0, 0, &platform.connector->connector_id, 1, mode);
+-    if (result != 0)
+-    {
+-        TRACELOG(LOG_ERROR, "DISPLAY: drmModeSetCrtc() failed with result: %d (%s)", result, strerror(errno));
+-        TRACELOG(LOG_ERROR, "DISPLAY: CRTC ID: %u, FB ID: %u, Connector ID: %u", crtcId, fb, platform.connector->connector_id);
+-        TRACELOG(LOG_ERROR, "DISPLAY: Mode: %dx%d@%d", mode->hdisplay, mode->vdisplay, mode->vrefresh);
+ 
+-        drmModeRmFB(platform.fd, fb);
+-        struct drm_mode_destroy_dumb dreq = { 0 };
+-        dreq.handle = creq.handle;
+-        drmIoctl(platform.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
++        platform.dumbBack = 1;
++        platform.dumbReady = true;
+         return;
+     }
+ 
+-    // Clean up previous framebuffer
+-    if (platform.prevFB)
+-    {
+-        result = drmModeRmFB(platform.fd, platform.prevFB);
+-        if (result != 0) TRACELOG(LOG_WARNING, "DISPLAY: drmModeRmFB() failed with result: %d", result);
+-    }
++    // The back buffer is scanned out until the flip queued last frame has completed
++    if (platform.dumbFlipPending) WaitSoftwarePageFlip();
+ 
+-    platform.prevFB = fb;
++    DumbBuffer *back = &platform.dumb[platform.dumbBack];
+ 
+-    // Clean up previous dumb buffer
+-    if (platform.prevDumbHandle)
++    // NOTE: RLSW will make a simple copy if the dimensions match
++    swBlitPixels(0, 0, width, height, 0, 0, width, height, SW_RGBA, SW_UNSIGNED_BYTE, back->map);
++
++    if (drmModePageFlip(platform.fd, platform.crtc->crtc_id, back->fb, DRM_MODE_PAGE_FLIP_EVENT, NULL) == 0) platform.dumbFlipPending = true;
++    else if (drmModeSetCrtc(platform.fd, platform.crtc->crtc_id, back->fb, 0, 0, &platform.connector->connector_id, 1, mode) != 0)
+     {
+-        struct drm_mode_destroy_dumb dreq = { 0 };
+-        dreq.handle = platform.prevDumbHandle;
+-        drmIoctl(platform.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
++        TRACELOG(LOG_WARNING, "DISPLAY: Failed to show the frame: %s", strerror(errno));
++        return;
+     }
+ 
+-    platform.prevDumbHandle = creq.handle;
++    platform.dumbBack = (platform.dumbBack + 1)%DRM_SW_BUFFERS;
+ #endif
+ }
+ #endif // SUPPORT_DRM_CACHE
+@@ -1230,7 +1301,10 @@ int InitPlatform(void)
+     platform.gbmSurface = NULL;
+     platform.prevBO = NULL;
+ #else
+-    platform.prevDumbHandle = 0;
++    memset(platform.dumb, 0, sizeof(platform.dumb));
++    platform.dumbBack = 0;
++    platform.dumbReady = false;
++    platform.dumbFlipPending = false;
+ #endif
+ 
+     // Initialize graphic device: display/window and graphic context
+@@ -1363,41 +1437,7 @@ int InitPlatform(void)
+         return -1;
+     }
+ 
+-    // If InitWindow should use the current mode find it in the connector's mode list
+-    if ((CORE.Window.screen.width <= 0) || (CORE.Window.screen.height <= 0))
+-    {
+-        TRACELOG(LOG_TRACE, "DISPLAY: Selecting DRM connector mode for current used mode...");
+-
+-        platform.modeIndex = FindMatchingConnectorMode(platform.connector, &platform.crtc->mode);
+-
+-        if (platform.modeIndex < 0)
+-        {
+-            TRACELOG(LOG_WARNING, "DISPLAY: No matching DRM connector mode found");
+-            drmModeFreeEncoder(enc);
+-            drmModeFreeConnector(platform.connector);
+-            drmModeFreeResources(res);
+-            close(platform.fd);
+-            return -1;
+-        }
+-
+-        CORE.Window.screen.width = CORE.Window.display.width;
+-        CORE.Window.screen.height = CORE.Window.display.height;
+-    }
+-
+-    const bool allowInterlaced = FLAG_IS_SET(CORE.Window.flags, FLAG_INTERLACED_HINT);
+-    const int fps = (CORE.Time.target > 0)? (1.0/CORE.Time.target) : 60;
+-
+-    // Try to find an exact matching mode
+-    platform.modeIndex = FindExactConnectorMode(platform.connector, CORE.Window.screen.width, CORE.Window.screen.height, fps, allowInterlaced);
+-
+-    // If nothing found, try to find a nearly matching mode
+-    if (platform.modeIndex < 0) platform.modeIndex = FindNearestConnectorMode(platform.connector, CORE.Window.screen.width, CORE.Window.screen.height, fps, allowInterlaced);
+-
+-    // If nothing found, try to find an exactly matching mode including interlaced
+-    if (platform.modeIndex < 0) platform.modeIndex = FindExactConnectorMode(platform.connector, CORE.Window.screen.width, CORE.Window.screen.height, fps, true);
+-
+-    // If nothing found, try to find a nearly matching mode including interlaced
+-    if (platform.modeIndex < 0) platform.modeIndex = FindNearestConnectorMode(platform.connector, CORE.Window.screen.width, CORE.Window.screen.height, fps, true);
++    platform.modeIndex = SelectConnectorMode();
+ 
+     // If nothing found, there is no suitable mode
+     if (platform.modeIndex < 0)
+@@ -1421,28 +1461,36 @@ int InitPlatform(void)
+     drmModeFreeEncoder(enc);
+     enc = NULL;
+ #else
+-    // For software rendering, the first available mode can be used
+-    if (platform.connector->count_modes > 0)
++    // For software rendering the connector may have no encoder and so no CRTC
++    if (platform.connector->encoder_id)
+     {
+-        platform.modeIndex = 0;
+-        CORE.Window.display.width = platform.connector->modes[0].hdisplay;
+-        CORE.Window.display.height = platform.connector->modes[0].vdisplay;
+-
+-        TRACELOG(LOG_INFO, "DISPLAY: Selected DRM connector mode %s (%ux%u%c@%u) for software rendering",
+-                 platform.connector->modes[0].name,
+-                 platform.connector->modes[0].hdisplay,
+-                 platform.connector->modes[0].vdisplay,
+-                 (platform.connector->modes[0].flags & DRM_MODE_FLAG_INTERLACE)? 'i' : 'p',
+-                 platform.connector->modes[0].vrefresh);
++        drmModeEncoder *enc = drmModeGetEncoder(platform.fd, platform.connector->encoder_id);
++        if (enc)
++        {
++            if (enc->crtc_id) platform.crtc = drmModeGetCrtc(platform.fd, enc->crtc_id);
++            drmModeFreeEncoder(enc);
++        }
+     }
+-    else
++
++    platform.modeIndex = SelectConnectorMode();
++
++    if (platform.modeIndex < 0)
+     {
+-        TRACELOG(LOG_WARNING, "DISPLAY: No modes available for connector");
++        TRACELOG(LOG_WARNING, "DISPLAY: Failed to find a suitable DRM connector mode");
+         drmModeFreeConnector(platform.connector);
+         drmModeFreeResources(res);
+         close(platform.fd);
+         return -1;
+     }
++
++    CORE.Window.display.width = platform.connector->modes[platform.modeIndex].hdisplay;
++    CORE.Window.display.height = platform.connector->modes[platform.modeIndex].vdisplay;
++
++    TRACELOG(LOG_INFO, "DISPLAY: Selected DRM connector mode %s (%ux%u%c@%u) for software rendering",
++        platform.connector->modes[platform.modeIndex].name,
++        platform.connector->modes[platform.modeIndex].hdisplay, platform.connector->modes[platform.modeIndex].vdisplay,
++        FLAG_IS_SET(platform.connector->modes[platform.modeIndex].flags, DRM_MODE_FLAG_INTERLACE)? 'i' : 'p',
++        platform.connector->modes[platform.modeIndex].vrefresh);
+ #endif
+ 
+     // Use the width and height of the surface for render
+@@ -1771,6 +1819,10 @@ void ClosePlatform(void)
+         platform.crtc = NULL;
+     }
+ 
++#if defined(GRAPHICS_API_OPENGL_SOFTWARE)
++    DestroyDumbBuffers();
++#endif
++
+     if (platform.fd != -1)
+     {
+         close(platform.fd);
+@@ -2879,6 +2931,72 @@ static int FindMatchingConnectorMode(const drmModeConnector *connector, const dr
+     #undef BINCMP
+ }
+ 
++// Select the connector mode for the requested screen size
++// NOTE: The mode currently shown is preferred when it fits. The kernel has chosen it already,
++// e.g. from video= on the command line, and a display often lists several modes with the
++// same size and refresh rate but different timings, which not all displays show correctly
++static int SelectConnectorMode(void)
++{
++    int currentIndex = -1;
++
++    if ((platform.crtc != NULL) && platform.crtc->mode_valid)
++    {
++        const drmModeModeInfo *const current = &platform.crtc->mode;
++
++        for (int i = 0; i < platform.connector->count_modes; i++)
++        {
++            const drmModeModeInfo *const mode = &platform.connector->modes[i];
++
++            if ((mode->clock == current->clock) && (mode->flags == current->flags) &&
++                (mode->hdisplay == current->hdisplay) && (mode->hsync_start == current->hsync_start) &&
++                (mode->hsync_end == current->hsync_end) && (mode->htotal == current->htotal) &&
++                (mode->vdisplay == current->vdisplay) && (mode->vsync_start == current->vsync_start) &&
++                (mode->vsync_end == current->vsync_end) && (mode->vtotal == current->vtotal))
++            {
++                currentIndex = i;
++                break;
++            }
++        }
++    }
++
++    // If InitWindow should use the current mode, use it as it is
++    if ((CORE.Window.screen.width <= 0) || (CORE.Window.screen.height <= 0))
++    {
++        TRACELOG(LOG_TRACE, "DISPLAY: Selecting DRM connector mode for current used mode...");
++
++        int index = (currentIndex >= 0)? currentIndex : 0;
++        CORE.Window.screen.width = platform.connector->modes[index].hdisplay;
++        CORE.Window.screen.height = platform.connector->modes[index].vdisplay;
++
++        if (currentIndex >= 0) return currentIndex;
++    }
++
++    const bool allowInterlaced = FLAG_IS_SET(CORE.Window.flags, FLAG_INTERLACED_HINT);
++    const int fps = (CORE.Time.target > 0)? (1.0/CORE.Time.target) : 60;
++
++    if (currentIndex >= 0)
++    {
++        const drmModeModeInfo *const mode = &platform.connector->modes[currentIndex];
++
++        if ((mode->hdisplay == CORE.Window.screen.width) && (mode->vdisplay == CORE.Window.screen.height) && (mode->vrefresh == fps) &&
++            (allowInterlaced || !FLAG_IS_SET(mode->flags, DRM_MODE_FLAG_INTERLACE))) return currentIndex;
++    }
++
++    // Try to find an exact matching mode
++    int index = FindExactConnectorMode(platform.connector, CORE.Window.screen.width, CORE.Window.screen.height, fps, allowInterlaced);
++
++    // If nothing found, try to find a nearly matching mode
++    if (index < 0) index = FindNearestConnectorMode(platform.connector, CORE.Window.screen.width, CORE.Window.screen.height, fps, allowInterlaced);
++
++    // If nothing found, try to find an exactly matching mode including interlaced
++    if (index < 0) index = FindExactConnectorMode(platform.connector, CORE.Window.screen.width, CORE.Window.screen.height, fps, true);
++
++    // If nothing found, try to find a nearly matching mode including interlaced
++    if (index < 0) index = FindNearestConnectorMode(platform.connector, CORE.Window.screen.width, CORE.Window.screen.height, fps, true);
++
++    return index;
++}
++
+ // Search exactly matching DRM connector mode in connector's list
+ static int FindExactConnectorMode(const drmModeConnector *connector, uint width, uint height, uint fps, bool allowInterlaced)
+ {
+-- 
+2.55.0
+
