@@ -11,6 +11,7 @@ SRC_URI = "\
     file://0004-DRM-detect-input-devices-plugged-in-after-startup.patch \
     file://0005-DRM-do-not-sum-relative-movement-across-multiple-mo.patch \
     file://0006-software-fix-scissor-Y-double-flip-causing-scissore.patch \
+    file://0007-DRM-keep-keys-pressed-and-released-within-one-frame.patch \
 "
 SRCREV = "dbc56a87da87d973a9c5baa4e7438a9d20121d28"
 

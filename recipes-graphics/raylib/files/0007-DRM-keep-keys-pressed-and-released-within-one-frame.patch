@@ -1,0 +1,65 @@
+Subject: [PATCH] DRM: keep keys pressed and released within one frame
+
+PollKeyboardEvents() set currentKeyState straight from each event, so a
+key pressed and released between two frames was up again when the frame
+looked at it, and IsKeyPressed(), which compares previousKeyState with
+currentKeyState, never reported it. On a slow board, where a frame can
+take longer than a short key tap, presses got lost and a key had to be
+hit several times.
+
+Keep such a key down until the next poll and release it then.
+
+Upstream-Status: Pending
+---
+ src/platforms/rcore_drm.c | 28 +++++++++++++++++++++++++++-
+ 1 file changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/src/platforms/rcore_drm.c b/src/platforms/rcore_drm.c
+index 2dcf0fff0..16477fc63 100644
+--- a/src/platforms/rcore_drm.c
++++ b/src/platforms/rcore_drm.c
+@@ -2376,6 +2376,20 @@ static void ConfigureEvdevDevice(char *device)
+ // Poll and process evdev keyboard events
+ static void PollKeyboardEvents(void)
+ {
++    // PATCH: a key pressed and released within the same frame is kept down
++    // until the next frame, otherwise IsKeyPressed() never sees it. Release
++    // those keys now, after PollInputEvents() has copied the states into
++    // previousKeyState.
++    static bool pendingRelease[MAX_KEYBOARD_KEYS] = { 0 };
++    for (int k = 0; k < MAX_KEYBOARD_KEYS; k++)
++    {
++        if (pendingRelease[k])
++        {
++            CORE.Input.Keyboard.currentKeyState[k] = 0;
++            pendingRelease[k] = false;
++        }
++    }
++
+     // PATCH: alle als Tastatur erkannten evdev-Fds pollen, nicht nur
+     // den ersten gefundenen (siehe Kommentar bei keyboardFdCount).
+     for (int kbdIdx = 0; kbdIdx < platform.keyboardFdCount; kbdIdx++)
+@@ -2408,7 +2422,19 @@ static void PollKeyboardEvents(void)
+                 // WARNING: https://www.kernel.org/doc/Documentation/input/input.txt
+                 // Event interface: 'value' is the value the event carries. Either a relative change for EV_REL,
+                 // absolute new value for EV_ABS (joysticks ...), or 0 for EV_KEY for release, 1 for keypress and 2 for autorepeat
+-                CORE.Input.Keyboard.currentKeyState[keycode] = (event.value >= 1);
++                if ((event.value == 0) &&
++                    (CORE.Input.Keyboard.previousKeyState[keycode] == 0) &&
++                    (CORE.Input.Keyboard.currentKeyState[keycode] == 1))
++                {
++                    // PATCH: pressed and released within this frame - keep it
++                    // down for this frame, release it on the next poll
++                    pendingRelease[keycode] = true;
++                }
++                else
++                {
++                    CORE.Input.Keyboard.currentKeyState[keycode] = (event.value >= 1);
++                    if (event.value >= 1) pendingRelease[keycode] = false;
++                }
+                 CORE.Input.Keyboard.keyRepeatInFrame[keycode] = (event.value == 2);
+ 
+                 // If the key is pressed add it to the queues
+-- 
+2.55.0
+
