@@ -3336,7 +3336,17 @@ static bool try_get_preferred_display_mode(int* outW, int* outH) {
                 drmModeModeInfo best = conn->modes[0]; // fallback: first mode
                 long bestArea = (long)best.hdisplay * best.vdisplay;
                 bool foundPreferred = false;
+                // A mode forced with video= on the kernel command line is
+                // marked USERDEF and wins over the EDID preference - the way
+                // to keep software rendering usable on a 4K TV.
                 for (int m = 0; m < conn->count_modes; m++) {
+                    if (conn->modes[m].type & DRM_MODE_TYPE_USERDEF) {
+                        best = conn->modes[m];
+                        foundPreferred = true;
+                        break;
+                    }
+                }
+                for (int m = 0; !foundPreferred && m < conn->count_modes; m++) {
                     if (conn->modes[m].type & DRM_MODE_TYPE_PREFERRED) {
                         best = conn->modes[m];
                         foundPreferred = true;
