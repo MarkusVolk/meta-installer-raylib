@@ -1,0 +1,68 @@
+Subject: [PATCH] DRM: do not take touchpads for touchscreens
+
+A device with absolute X/Y axes and touch buttons or multitouch axes was
+classified as a touchscreen, and a touchscreen discards every mouse.
+Touchpads report the same, but they carry INPUT_PROP_POINTER. A Logitech
+Bolt receiver always registers such a touchpad interface, even for a
+mouse like the MX Master 3S, so with the receiver plugged in all mice
+were dropped, nothing ever came from the touchpad interface and the
+cursor stayed at 0,0.
+
+Leave devices with INPUT_PROP_POINTER out of the touchscreen and
+absolute mouse cases.
+
+Upstream-Status: Pending
+---
+ src/platforms/rcore_drm.c | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/platforms/rcore_drm.c b/src/platforms/rcore_drm.c
+index 16477fc63..ab58108dd 100644
+--- a/src/platforms/rcore_drm.c
++++ b/src/platforms/rcore_drm.c
+@@ -2143,6 +2143,15 @@ static void ConfigureEvdevDevice(char *device)
+     ioctl(fd, EVIOCGBIT(0, sizeof(evBits)), evBits);
+     ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keyBits)), keyBits);
+ 
++    // PATCH: touchpads (INPUT_PROP_POINTER) report absolute X/Y and touch
++    // buttons like a touchscreen, but move a pointer indirectly. Taking them
++    // for a touchscreen made every real mouse get discarded - e.g. the extra
++    // touchpad interface of a Logitech Bolt receiver, which never sends
++    // anything, left the cursor stuck at 0,0.
++    unsigned long propBits[NBITS(INPUT_PROP_MAX)] = { 0 };
++    ioctl(fd, EVIOCGPROP(sizeof(propBits)), propBits);
++    bool isTouchpad = TEST_BIT(propBits, INPUT_PROP_POINTER);
++
+     if (TEST_BIT(evBits, EV_ABS))
+     {
+         ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absBits)), absBits);
+@@ -2162,14 +2171,14 @@ static void ConfigureEvdevDevice(char *device)
+         }
+ 
+         // If it has any of these buttons it's a touch device
+-        if (hasAbsXY &&
++        if (hasAbsXY && !isTouchpad &&
+            (TEST_BIT(keyBits, BTN_STYLUS) ||
+             TEST_BIT(keyBits, BTN_TOOL_PEN) ||
+             TEST_BIT(keyBits, BTN_TOOL_FINGER) ||
+             TEST_BIT(keyBits, BTN_TOUCH))) isTouch = true;
+ 
+         // Absolute mice should really only exist with VMWare
+-        else if (hasAbsXY && TEST_BIT(keyBits, BTN_MOUSE)) isMouse = true;
++        else if (hasAbsXY && !isTouchpad && TEST_BIT(keyBits, BTN_MOUSE)) isMouse = true;
+ 
+         // If any of the common joystick axes are present, assume it's a gamepad
+         else
+@@ -2188,7 +2197,8 @@ static void ConfigureEvdevDevice(char *device)
+         }
+ 
+         // If the device has multitouch axes, it's a touch device
+-        if (TEST_BIT(absBits, ABS_MT_POSITION_X) &&
++        if (!isTouchpad &&
++            TEST_BIT(absBits, ABS_MT_POSITION_X) &&
+             TEST_BIT(absBits, ABS_MT_POSITION_Y)) isTouch = true;
+     }
+ 
+-- 
+2.55.0
+
