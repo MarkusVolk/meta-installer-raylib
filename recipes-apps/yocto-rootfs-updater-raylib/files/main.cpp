@@ -3336,6 +3336,7 @@ static bool try_get_preferred_display_mode(int* outW, int* outH) {
                 drmModeModeInfo best = conn->modes[0]; // fallback: first mode
                 long bestArea = (long)best.hdisplay * best.vdisplay;
                 bool foundPreferred = false;
+                bool userDefined = false;
                 // A mode forced with video= on the kernel command line is
                 // marked USERDEF and wins over the EDID preference - the way
                 // to keep software rendering usable on a 4K TV.
@@ -3343,6 +3344,7 @@ static bool try_get_preferred_display_mode(int* outW, int* outH) {
                     if (conn->modes[m].type & DRM_MODE_TYPE_USERDEF) {
                         best = conn->modes[m];
                         foundPreferred = true;
+                        userDefined = true;
                         break;
                     }
                 }
@@ -3357,6 +3359,19 @@ static bool try_get_preferred_display_mode(int* outW, int* outH) {
                     for (int m = 0; m < conn->count_modes; m++) {
                         long area = (long)conn->modes[m].hdisplay * conn->modes[m].vdisplay;
                         if (area > bestArea) { best = conn->modes[m]; bestArea = area; }
+                    }
+                }
+                if (!userDefined && (long)best.hdisplay * best.vdisplay > 1920L * 1080L) {
+                    long cappedArea = 0;
+                    for (int m = 0; m < conn->count_modes; m++) {
+                        const drmModeModeInfo& mode = conn->modes[m];
+                        if (mode.flags & DRM_MODE_FLAG_INTERLACE) continue;
+                        if (mode.hdisplay > 1920 || mode.vdisplay > 1080) continue;
+                        long area = (long)mode.hdisplay * mode.vdisplay;
+                        bool better = area > cappedArea ||
+                                      (area == cappedArea && mode.vrefresh == 60 && best.vrefresh != 60) ||
+                                      (area == cappedArea && best.vrefresh != 60 && mode.vrefresh > best.vrefresh);
+                        if (better) { best = mode; cappedArea = area; }
                     }
                 }
                 *outW = best.hdisplay;
@@ -3564,7 +3579,7 @@ int main(void) {
     if (g_ui_scale > 4.0f) g_ui_scale = 4.0f;
     log_msg("UI scale: " + std::to_string(g_ui_scale) + "x (at " +
              std::to_string(g_canvas_w) + "x" + std::to_string(g_canvas_h) + ")");
-    SetTargetFPS(30);
+    SetTargetFPS(60);
 
     // Real TTF font instead of raylib's blocky bitmap default.
     // Codepoints 32-255 cover Latin-1, including German umlauts.
@@ -3727,7 +3742,23 @@ int main(void) {
 
     double reboot_requested_at = -1.0;
     bool ever_rendered = false;
+    double frame_stats_since = GetTime();
+    int frame_stats_count = 0;
+    float frame_stats_max = 0.0f;
     while (true) {
+        if (g_cfg_debug_mode) {
+            float ft = GetFrameTime();
+            frame_stats_count++;
+            if (ft > frame_stats_max) frame_stats_max = ft;
+            double now = GetTime();
+            if (now - frame_stats_since >= 5.0) {
+                log_msg("Frames: " + std::to_string((int)(frame_stats_count / (now - frame_stats_since))) +
+                        " fps, longest " + std::to_string((int)(frame_stats_max * 1000.0f)) + " ms");
+                frame_stats_since = now;
+                frame_stats_count = 0;
+                frame_stats_max = 0.0f;
+            }
+        }
         // WindowShouldClose() is raylib's ESC/close-signal check - but
         // WindowShouldClose()'s own real DRM-backend implementation
         // (confirmed directly in rcore_drm.c's own source) is level-
