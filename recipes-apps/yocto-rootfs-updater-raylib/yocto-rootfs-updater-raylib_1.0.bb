@@ -48,6 +48,7 @@ do_install:append() {
     install -m 0644 ${UNPACKDIR}/yocto-rootfs-updater-raylib.service ${D}${systemd_system_unitdir}/
     install -d ${D}${sysconfdir}/yocto-rootfs-updater-raylib
     install -m 0644 ${UNPACKDIR}/config.toml ${D}${sysconfdir}/yocto-rootfs-updater-raylib/config.toml
+    sed -i 's/^kernel_target_name = .*/kernel_target_name = "${KERNEL_IMAGETYPE}"/' ${D}${sysconfdir}/yocto-rootfs-updater-raylib/config.toml
 }
 
 FILES:${PN} += "\
