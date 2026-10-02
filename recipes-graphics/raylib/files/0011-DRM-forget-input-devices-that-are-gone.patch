@@ -1,0 +1,160 @@
+From: Markus Volk <f_l_k@t-online.de>
+Date: Wed, 1 Oct 2026 14:10:00 +0200
+Subject: [PATCH] DRM: forget input devices that are gone
+
+An unplugged device kept its path in knownEvdevPaths[] and its dead fd
+in the keyboard and mouse lists. A device plugged in again usually gets
+the same event node, which the rescan then took for already known, so
+a mouse unplugged and plugged back in never worked again until a
+restart.
+
+Drop a device as soon as its node is gone or a read on it fails with
+ENODEV: close the fd, take it out of the poll lists and forget its
+path, so the next rescan configures the new node.
+
+Upstream-Status: Pending
+---
+ src/platforms/rcore_drm.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/src/platforms/rcore_drm.c
++++ b/src/platforms/rcore_drm.c
+@@ -187,6 +187,7 @@
+     #define EVDEV_PATH_MAXLEN 64
+     char knownEvdevPaths[MAX_KNOWN_EVDEV_PATHS][EVDEV_PATH_MAXLEN];
+     int knownEvdevPathCount;
++    int knownEvdevFds[MAX_KNOWN_EVDEV_PATHS];
+     int touchSlot;                      // Hold the touch slot number of the currently being sent multitouch block
+     bool touchActive[MAX_TOUCH_POINTS]; // Track which touch points are currently active
+     Vector2 touchPosition[MAX_TOUCH_POINTS]; // Track touch positions for each slot
+@@ -351,6 +352,7 @@
+ // Input management functions
+ static void InitEvdevInput(void);               // Initialize evdev inputs
+ static void RescanEvdevInputForNewDevices(void); // PATCH: periodically detect input devices plugged in after startup
++static void ForgetEvdevDevice(int fd);           // PATCH: drop an input device that is gone
+ static void ConfigureEvdevDevice(char *device); // Identifies a input device and configures it for use if appropriate
+ static void PollKeyboardEvents(void);           // Process evdev keyboard events
+ static void PollGamepadEvents(void);            // Process evdev gamepad events
+@@ -2115,12 +2117,70 @@
+ // responsive enough for a human plugging in a device and expecting it
+ // to work within a couple of seconds, which is the actual real-world
+ // need here (this is not a high-frequency hotplug scenario).
++// PATCH: an unplugged device keeps its path in knownEvdevPaths[] and its fd
++// in the poll lists, so a device plugged in again under the same event node
++// was never picked up. Drop it from both as soon as its node is gone or a
++// read fails with ENODEV.
++static void ForgetEvdevDevice(int fd)
++{
++    bool owned = false;
++
++    if (fd < 0) return;
++
++    for (int i = 0; i < platform.knownEvdevPathCount; i++)
++    {
++        if (platform.knownEvdevFds[i] != fd) continue;
++        TRACELOG(LOG_INFO, "INPUT: Input device %s is gone", platform.knownEvdevPaths[i]);
++        for (int j = i + 1; j < platform.knownEvdevPathCount; j++)
++        {
++            strncpy(platform.knownEvdevPaths[j - 1], platform.knownEvdevPaths[j], EVDEV_PATH_MAXLEN);
++            platform.knownEvdevFds[j - 1] = platform.knownEvdevFds[j];
++        }
++        platform.knownEvdevPathCount--;
++        break;
++    }
++
++    for (int i = 0; i < platform.keyboardFdCount; i++)
++    {
++        if (platform.keyboardFds[i] != fd) continue;
++        for (int j = i + 1; j < platform.keyboardFdCount; j++) platform.keyboardFds[j - 1] = platform.keyboardFds[j];
++        platform.keyboardFdCount--;
++        platform.keyboardFds[platform.keyboardFdCount] = -1;
++        owned = true;
++        break;
++    }
++    if (platform.keyboardFd == fd) platform.keyboardFd = (platform.keyboardFdCount > 0)? platform.keyboardFds[0] : -1;
++
++    for (int i = 0; i < platform.mouseFdCount; i++)
++    {
++        if (platform.mouseFds[i] != fd) continue;
++        for (int j = i + 1; j < platform.mouseFdCount; j++) platform.mouseFds[j - 1] = platform.mouseFds[j];
++        platform.mouseFdCount--;
++        platform.mouseFds[platform.mouseFdCount] = -1;
++        owned = true;
++        break;
++    }
++    if (platform.mouseFd == fd)
++    {
++        platform.mouseFd = -1;
++        platform.mouseIsTouch = false;
++        owned = true;
++    }
++
++    if (owned) close(fd);
++}
++
+ static void RescanEvdevInputForNewDevices(void)
+ {
+     char path[MAX_FILEPATH_LENGTH] = { 0 };
+     DIR *directory = NULL;
+     struct dirent *entity = NULL;
+ 
++    for (int i = platform.knownEvdevPathCount - 1; i >= 0; i--)
++    {
++        if (access(platform.knownEvdevPaths[i], F_OK) != 0) ForgetEvdevDevice(platform.knownEvdevFds[i]);
++    }
++
+     directory = opendir(DEFAULT_EVDEV_PATH);
+     if (!directory) return;
+ 
+@@ -2429,6 +2489,7 @@
+     {
+         strncpy(platform.knownEvdevPaths[platform.knownEvdevPathCount], device, EVDEV_PATH_MAXLEN - 1);
+         platform.knownEvdevPaths[platform.knownEvdevPathCount][EVDEV_PATH_MAXLEN - 1] = '\0';
++        platform.knownEvdevFds[platform.knownEvdevPathCount] = fd;
+         platform.knownEvdevPathCount++;
+     }
+ 
+@@ -2461,9 +2522,10 @@
+ 
+     struct input_event event = { 0 };
+     int keycode = -1;
++    int readResult = 0;
+ 
+     // Try to read data from the keyboard and only continue if successful
+-    while (read(fd, &event, sizeof(event)) == (int)sizeof(event))
++    while ((readResult = read(fd, &event, sizeof(event))) == (int)sizeof(event))
+     {
+         // Check if the event is a key event
+         if (event.type != EV_KEY) continue;
+@@ -2525,6 +2587,11 @@
+             }
+         }
+     }
++    if ((readResult < 0) && (errno == ENODEV))
++    {
++        ForgetEvdevDevice(fd);
++        kbdIdx--;
++    }
+     } // Ende PATCH-Schleife ueber platform.keyboardFds[]
+ }
+ static void PollGamepadEvents(void)
+@@ -2656,9 +2723,10 @@
+     struct input_event event = { 0 };
+     int touchAction = -1;           // 0-TOUCH_ACTION_UP, 1-TOUCH_ACTION_DOWN, 2-TOUCH_ACTION_MOVE
+     static bool isMultitouch = false; // Detect if device supports MT events
++    int readResult = 0;
+ 
+     // Try to read data from the mouse/touch/gesture and only continue if successful
+-    while (read(fd, &event, sizeof(event)) == (int)sizeof(event))
++    while ((readResult = read(fd, &event, sizeof(event))) == (int)sizeof(event))
+     {
+         // Relative movement parsing
+         if (event.type == EV_REL)
+@@ -2934,6 +3002,7 @@
+         }
+ #endif
+     }
++    if ((readResult < 0) && (errno == ENODEV)) ForgetEvdevDevice(fd);
+     } // Ende PATCH-Schleife ueber pollFds[] (Touch-fd + alle Maus-fds)
+ }
+ 

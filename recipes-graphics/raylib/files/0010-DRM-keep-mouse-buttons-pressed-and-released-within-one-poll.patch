@@ -1,0 +1,86 @@
+From: Markus Volk <f_l_k@t-online.de>
+Date: Wed, 1 Oct 2026 13:20:00 +0200
+Subject: [PATCH] DRM: keep mouse buttons pressed and released within one poll
+
+A tap on a touchpad presses and releases the button within a few
+milliseconds. On a slow board a frame takes longer than that, so both
+events arrived in the same PollMouseEvents() call, the evdev state was
+back to released before PollInputEvents() copied it, and
+IsMouseButtonPressed() never saw the click. A dedicated mouse button,
+held by a human for longer, worked.
+
+Keep such a button down until the next poll and release it then, the
+same way the keyboard patch handles short key taps.
+
+Upstream-Status: Pending
+---
+ src/platforms/rcore_drm.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/src/platforms/rcore_drm.c
++++ b/src/platforms/rcore_drm.c
+@@ -2580,8 +2580,36 @@
+ }
+ 
+ // Poll mouse input events
++// PATCH: a button pressed and released within the same poll is kept down
++// until the next poll, otherwise IsMouseButtonPressed() never sees the click.
++// A tap on a touchpad takes less than one frame on a slow board.
++static bool mouseReleasePending[MAX_MOUSE_BUTTONS] = { 0 };
++static bool mousePressedThisPoll[MAX_MOUSE_BUTTONS] = { 0 };
++
++static void SetEvdevButtonState(int button, int value)
++{
++    if (value > 0)
++    {
++        platform.currentButtonStateEvdev[button] = 1;
++        mousePressedThisPoll[button] = true;
++        mouseReleasePending[button] = false;
++    }
++    else if (mousePressedThisPoll[button]) mouseReleasePending[button] = true;
++    else platform.currentButtonStateEvdev[button] = 0;
++}
++
+ static void PollMouseEvents(void)
+ {
++    for (int b = 0; b < MAX_MOUSE_BUTTONS; b++)
++    {
++        if (mouseReleasePending[b])
++        {
++            platform.currentButtonStateEvdev[b] = 0;
++            mouseReleasePending[b] = false;
++        }
++        mousePressedThisPoll[b] = false;
++    }
++
+     // PATCH: poll the touch fd (if any, still single-device as before)
+     // AND all mouse-classified fds (now potentially several, see the
+     // struct comment on mouseFds[]/ConfigureEvdevDevice() above) -
+@@ -2805,7 +2833,7 @@
+             // Mouse button parsing
+             if ((event.code == BTN_TOUCH) || (event.code == BTN_LEFT))
+             {
+-                platform.currentButtonStateEvdev[MOUSE_BUTTON_LEFT] = event.value;
++                SetEvdevButtonState(MOUSE_BUTTON_LEFT, event.value);
+ 
+                 if (event.value > 0)
+                 {
+@@ -2846,12 +2874,12 @@
+                 }
+             }
+ 
+-            if (event.code == BTN_RIGHT) platform.currentButtonStateEvdev[MOUSE_BUTTON_RIGHT] = event.value;
+-            if (event.code == BTN_MIDDLE) platform.currentButtonStateEvdev[MOUSE_BUTTON_MIDDLE] = event.value;
+-            if (event.code == BTN_SIDE) platform.currentButtonStateEvdev[MOUSE_BUTTON_SIDE] = event.value;
+-            if (event.code == BTN_EXTRA) platform.currentButtonStateEvdev[MOUSE_BUTTON_EXTRA] = event.value;
+-            if (event.code == BTN_FORWARD) platform.currentButtonStateEvdev[MOUSE_BUTTON_FORWARD] = event.value;
+-            if (event.code == BTN_BACK) platform.currentButtonStateEvdev[MOUSE_BUTTON_BACK] = event.value;
++            if (event.code == BTN_RIGHT) SetEvdevButtonState(MOUSE_BUTTON_RIGHT, event.value);
++            if (event.code == BTN_MIDDLE) SetEvdevButtonState(MOUSE_BUTTON_MIDDLE, event.value);
++            if (event.code == BTN_SIDE) SetEvdevButtonState(MOUSE_BUTTON_SIDE, event.value);
++            if (event.code == BTN_EXTRA) SetEvdevButtonState(MOUSE_BUTTON_EXTRA, event.value);
++            if (event.code == BTN_FORWARD) SetEvdevButtonState(MOUSE_BUTTON_FORWARD, event.value);
++            if (event.code == BTN_BACK) SetEvdevButtonState(MOUSE_BUTTON_BACK, event.value);
+         }
+ 
+         // Screen confinement
