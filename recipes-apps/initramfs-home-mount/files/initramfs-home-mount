@@ -78,16 +78,21 @@ EFIVAR="${EFIVARS_DIR}/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
 # to work".
 mount -t efivarfs efivarfs -o nosuid,noexec,nodev "$EFIVARS_DIR" 2>/dev/null || true
 
-if ! [ -r "$EFIVAR" ]; then
-    echo "I: LoaderDevicePartUUID not available (not booted via systemd-boot, or not UEFI) - nothing to mount."
-    exit 0
+BOOT_PART_UUID=""
+if [ -r "$EFIVAR" ]; then
+    BOOT_PART_UUID=$(tail -c +5 "$EFIVAR" | tr -d '\000')
 fi
-
-# First 4 bytes of an EFI variable file are its own attribute flags,
-# not part of the value itself - skip them before decoding.
-BOOT_PART_UUID=$(tail -c +5 "$EFIVAR" | tr -d '\000')
 if [ -z "$BOOT_PART_UUID" ]; then
-    echo "I: could not decode LoaderDevicePartUUID - nothing to mount."
+    for ARG in $(cat /proc/cmdline); do
+        case "$ARG" in
+            squashfs=PARTUUID=*) BOOT_PART_UUID="${ARG#squashfs=PARTUUID=}"; BOOT_PART_UUID="${BOOT_PART_UUID%%:*}" ;;
+            root=PARTUUID=*) [ -n "$BOOT_PART_UUID" ] || BOOT_PART_UUID="${ARG#root=PARTUUID=}" ;;
+        esac
+    done
+    [ -n "$BOOT_PART_UUID" ] && echo "I: LoaderDevicePartUUID not available, using PARTUUID=$BOOT_PART_UUID from the kernel command line."
+fi
+if [ -z "$BOOT_PART_UUID" ]; then
+    echo "I: neither LoaderDevicePartUUID nor a PARTUUID on the kernel command line available - nothing to mount."
     exit 0
 fi
 # Lowercased - found via a real boot test: systemd-boot writes this
@@ -148,7 +153,7 @@ for CANDIDATE in $(list_partitions); do
     [ -b "$CANDIDATE" ] || continue
     CANDIDATE_LABEL=$(blkid -o value -s LABEL "$CANDIDATE" 2>/dev/null || true)
     case "$CANDIDATE_LABEL" in
-        "$LABEL"|"$LABEL"-*) ;;
+        "$LABEL"|"$LABEL"-*|images) ;;
         *) continue ;;
     esac
     CANDIDATE_DISK=$(lsblk -no PKNAME "$CANDIDATE" 2>/dev/null || true)
@@ -174,7 +179,10 @@ for HOME_DEV in ${BOOT_DISK_PARTS} ${OTHER_DISK_PARTS}; do
     # Not fatal: one unreadable filesystem (damaged, or a type this
     # minimal image has no kernel module for) must not cost the others
     # their mount - the whole point of looking at several disks.
-    if mount -o ro "$HOME_DEV" "$TARGET"; then
+    EXISTING=$(findmnt -n -o TARGET -S "$HOME_DEV" 2>/dev/null | head -1)
+    if [ -n "$EXISTING" ] && mount --bind "$EXISTING" "$TARGET" && mount -o remount,bind,ro "$TARGET"; then
+        echo "Mounted $HOME_DEV at $TARGET (bound from $EXISTING)."
+    elif [ -z "$EXISTING" ] && mount -o ro "$HOME_DEV" "$TARGET"; then
         echo "Mounted $HOME_DEV at $TARGET."
     else
         echo "W: could not mount $HOME_DEV at $TARGET - skipping it."
@@ -184,5 +192,5 @@ for HOME_DEV in ${BOOT_DISK_PARTS} ${OTHER_DISK_PARTS}; do
 done
 
 if [ "$MOUNTED" -eq 0 ]; then
-    echo "I: no partition labeled \"$LABEL\" found - nothing to mount."
+    echo "I: no partition labeled \"$LABEL\" or \"images\" found - nothing to mount."
 fi

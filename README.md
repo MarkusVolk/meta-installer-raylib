@@ -197,7 +197,8 @@ sets `INCOMPATIBLE_LICENSE`.
   meta-image's `scripts/embed-squashfs-boot.sh`) — a rescue/recovery
   option that's always there, without a USB stick to keep track of.
   Standalone USB booting also works (`build-initramfs-installer-
-  image.sh`). On boot it mounts every partition labeled `home` it
+  image.sh`). On boot it mounts every partition labeled `home`,
+  `home-<image>` or `images` (the squashfs-boot image partition) it
   finds **read-only** (a rescue tool has no business writing to a
   system's own data partition), so files there stay available even
   though the installer itself runs entirely from RAM. The one on the
